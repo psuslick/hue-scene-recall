@@ -1,0 +1,19 @@
+{
+  "title": "Hue Scene Recall",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Choose a Hue bridge",
+        "description": "Hue Scene Recall reuses Home Assistant's existing local Hue V2 connection.",
+        "data": {
+          "hue_entry_id": "Hue bridge"
+        }
+      }
+    },
+    "abort": {
+      "no_available_hue_v2_bridge": "No unconfigured Hue V2 bridge is available. Add the Philips Hue integration first, or this bridge is already configured for Hue Scene Recall.",
+      "hue_bridge_missing": "The selected Hue bridge no longer exists.",
+      "already_configured": "This Hue bridge is already configured for Hue Scene Recall."
+    }
+  }
+}
