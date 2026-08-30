@@ -505,12 +505,22 @@ class HueSceneRecallManager:
             if room is None:
                 continue
             if new_state.state == STATE_OFF:
+                # Only a physical/manual power cut should begin a recall cycle.
+                # Automation-generated relay changes (bedtime, occupancy, scripts)
+                # carry a parent context and must not later resurrect the room scene.
+                if new_state.context.parent_id is not None:
+                    _LOGGER.debug(
+                        "Ignoring automation-generated power OFF from %s for %s",
+                        entity_id,
+                        room.room_name,
+                    )
+                    continue
                 room.power_cycle_active = True
                 room.recovery_attempts = 0
                 self._cancel_recovery_timer(room)
                 self._cancel_inactive_timer(room)
                 _LOGGER.debug(
-                    "Power source %s turned OFF for %s; preserving scene %s",
+                    "Physical power source %s turned OFF for %s; preserving scene %s",
                     entity_id,
                     room.room_name,
                     room.resume_scene_id,

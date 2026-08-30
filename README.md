@@ -128,4 +128,6 @@ Hue can keep a bulb's last-known HA state for several seconds after mains power 
 
 For any smart switch/relay that physically cuts power to a Hue room, add the **`hueRecallPower`** label to that switch and keep the room's existing room label on it (for example `isaacRoom`). Hue Scene Recall maps the relay to the room using that shared room label. While the relay is off it preserves the saved scene and suppresses false manual-divergence detection. When the relay returns on it waits for the Hue bulbs to rejoin and recalls the saved scene for the whole room, including continuously powered lamps in the same Hue room.
 
+Only a **physical/manual OFF transition** starts a `hueRecallPower` recovery cycle. Relay changes initiated by Home Assistant automations or scripts (for example bedtime or occupancy logic) are ignored as power-loss signals, so an automation cannot accidentally cause a saved scene to be restored later. If a physical OFF started the cycle, the next ON completes recovery even when that ON was initiated by Home Assistant.
+
 This label is optional. Normal/longer power outages are still handled through Hue-light availability recovery.
