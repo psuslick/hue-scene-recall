@@ -22,7 +22,6 @@ from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.storage import Store
 
 from .const import (
-    MANUAL_DIVERGENCE_DELAY,
     POWER_RECOVERY_MAX_ATTEMPTS,
     POWER_RECOVERY_RETRY_SECONDS,
     POWER_RECOVERY_SETTLE_SECONDS,
@@ -34,6 +33,7 @@ from .const import (
     STORAGE_SAVE_DELAY,
     STORAGE_VERSION,
 )
+from .context import is_unparented_context
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -62,7 +62,6 @@ class RoomRecallState:
     power_cycle_active: bool = False
     recovery_attempts: int = 0
     recovery_handle: asyncio.TimerHandle | None = field(default=None, repr=False)
-    inactive_handle: asyncio.TimerHandle | None = field(default=None, repr=False)
 
 
 class HueSceneRecallManager:
@@ -150,7 +149,8 @@ class HueSceneRecallManager:
         if self._own_tracker:
             self._tracker.start()
 
-        # Seed from current bridge state after tracker startup.
+        # Seed the sticky scene from the bridge. A currently active Hue scene is
+        # authoritative; temporary per-bulb changes never replace scene memory.
         for room_id in tuple(self.rooms):
             self._sync_scene_from_tracker(room_id)
 
@@ -232,7 +232,6 @@ class HueSceneRecallManager:
                     "resume_scene_id": room.resume_scene_id,
                     "resume_scene_mode": room.resume_scene_mode,
                     "desired_on": room.desired_on,
-                    "recall_armed": room.recall_armed,
                 }
                 for room_id, room in self.rooms.items()
             },
@@ -277,7 +276,9 @@ class HueSceneRecallManager:
                 room.resume_scene_id = stored.get("resume_scene_id")
                 room.resume_scene_mode = stored.get("resume_scene_mode")
                 room.desired_on = stored.get("desired_on")
-                room.recall_armed = bool(stored.get("recall_armed", False))
+                # v0.1.3 intentionally ignores the legacy persisted disarmed flag.
+                # Any still-valid remembered Hue scene is authoritative again.
+                room.recall_armed = room.resume_scene_id is not None
                 self.rooms[room_id] = room
                 if self._tracker is not None:
                     self._subscribe_tracker(room_id)
@@ -397,13 +398,11 @@ class HueSceneRecallManager:
 
         self._entity_to_rooms = entity_to_rooms
         self._power_entity_to_rooms = power_entity_to_rooms
-        for room in self.rooms.values():
-            if room.power_entity_ids and any(
-                (state := self.hass.states.get(entity_id)) is not None
-                and state.state == STATE_OFF
-                for entity_id in room.power_entity_ids
-            ):
-                room.power_cycle_active = True
+        # Never infer a physical/manual power cycle merely because a mapped relay
+        # is already OFF during setup or a topology refresh. We did not observe the
+        # OFF edge or its Context, so this could just as easily be bedtime or another
+        # intentional automation state. Recovery cycles begin only from an observed,
+        # unparented OFF transition while this manager is running.
         self._reset_state_listener()
         self._schedule_save()
         self._notify()
@@ -440,7 +439,8 @@ class HueSceneRecallManager:
         room.active_scene_id = active_scene_id
 
         if active_scene_id:
-            self._cancel_inactive_timer(room)
+            # Hue scene selection is the only event that replaces sticky scene
+            # memory. Temporary individual-bulb changes are intentionally ignored.
             room.resume_scene_id = active_scene_id
             room.resume_scene_mode = (
                 state.scene_mode.value if state.scene_mode is not None else None
@@ -448,51 +448,14 @@ class HueSceneRecallManager:
             room.desired_on = True
             room.recall_armed = True
             self._schedule_save()
-            self._notify()
-            return
-
-        if room.reconciling or room.power_cycle_active:
-            self._notify()
-            return
-
-        # Scene-to-scene changes can momentarily report no active scene. Delay the
-        # manual-divergence decision so a subsequent active scene or normal OFF
-        # transition can settle first.
-        self._cancel_inactive_timer(room)
-        room.inactive_handle = self.hass.loop.call_later(
-            MANUAL_DIVERGENCE_DELAY,
-            lambda: self.hass.async_create_task(
-                self._async_evaluate_inactive_scene(room_id)
-            ),
-        )
-        self._notify()
-
-    async def _async_evaluate_inactive_scene(self, room_id: str) -> None:
-        room = self.rooms.get(room_id)
-        if room is None:
-            return
-        room.inactive_handle = None
-        if room.active_scene_id is not None or room.reconciling or room.power_cycle_active:
-            return
-        if not self._all_available(room):
-            # Unavailability can be power loss; preserve the last valid scene.
-            return
-        if self._all_off(room):
-            room.desired_on = False
-            # Keep recall armed: OFF is power intent, not a scene.
-        elif self._any_on(room):
-            # Lights are reachable and still on but Hue no longer recognizes the
-            # saved scene: treat this as deliberate manual divergence.
-            room.desired_on = True
-            room.recall_armed = False
-        self._schedule_save()
         self._notify()
 
     @callback
     def _on_state_change(self, event: Event) -> None:
         entity_id = event.data["entity_id"]
+        new_state = event.data.get("new_state")
         if entity_id in self._power_entity_to_rooms:
-            self._process_power_state_change(entity_id, event.data.get("new_state"))
+            self._process_power_state_change(entity_id, new_state)
         for room_id in tuple(self._entity_to_rooms.get(entity_id, ())):
             self._process_room_light_state(room_id)
 
@@ -508,7 +471,7 @@ class HueSceneRecallManager:
                 # Only a physical/manual power cut should begin a recall cycle.
                 # Automation-generated relay changes (bedtime, occupancy, scripts)
                 # carry a parent context and must not later resurrect the room scene.
-                if new_state.context.parent_id is not None:
+                if not is_unparented_context(new_state.context):
                     _LOGGER.debug(
                         "Ignoring automation-generated power OFF from %s for %s",
                         entity_id,
@@ -518,7 +481,6 @@ class HueSceneRecallManager:
                 room.power_cycle_active = True
                 room.recovery_attempts = 0
                 self._cancel_recovery_timer(room)
-                self._cancel_inactive_timer(room)
                 _LOGGER.debug(
                     "Physical power source %s turned OFF for %s; preserving scene %s",
                     entity_id,
@@ -562,14 +524,12 @@ class HueSceneRecallManager:
 
         if room.power_cycle_active:
             room.all_available = current_all_available
-            self._cancel_inactive_timer(room)
             self._notify()
             return
 
         if not current_all_available:
             room.all_available = False
             self._cancel_recovery_timer(room)
-            self._cancel_inactive_timer(room)
             self._notify()
             return
 
@@ -591,7 +551,6 @@ class HueSceneRecallManager:
         old_desired_on = room.desired_on
         if self._all_off(room):
             room.desired_on = False
-            self._cancel_inactive_timer(room)
         elif self._any_on(room):
             room.desired_on = True
         if room.desired_on != old_desired_on:
@@ -867,15 +826,7 @@ class HueSceneRecallManager:
             room.recovery_handle.cancel()
             room.recovery_handle = None
 
-    @staticmethod
-    @callback
-    def _cancel_inactive_timer(room: RoomRecallState) -> None:
-        if room.inactive_handle:
-            room.inactive_handle.cancel()
-            room.inactive_handle = None
-
     @classmethod
     @callback
     def _cancel_room_timers(cls, room: RoomRecallState) -> None:
         cls._cancel_recovery_timer(room)
-        cls._cancel_inactive_timer(room)

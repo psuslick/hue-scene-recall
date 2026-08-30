@@ -4,6 +4,15 @@ A Home Assistant custom integration that remembers the last real Philips Hue sce
 
 It is built on `aiohue`'s `SceneActivityTracker` (available in Home Assistant 2026.8+ through `aiohue 4.9.0`) and reuses Home Assistant's already-authenticated local Hue V2 connection. It does **not** create a second Hue Bridge login, poll the cloud, or copy Hue scene definitions into Home Assistant.
 
+## v0.1.3 fixes
+
+- Simplify sticky recall around Hue's own scene model: only selecting a Hue scene changes the remembered scene.
+- Temporary per-bulb changes from Hue, Home Assistant, Apple Home, or automations do not disarm or replace scene memory.
+- Upgrades ignore the legacy persisted `recall_armed: false` value from v0.1.2 and re-arm any still-valid remembered scene.
+- Startup/topology refresh no longer guesses that an already-OFF `hueRecallPower` relay represents a physical outage.
+- The manifest declares an explicit `integration_type` for current hassfest validation.
+- Local 256/512 px brand icons and dependency-free regression/repository checks are included for CI.
+
 ## Why
 
 Hue bulbs behind a relay or wall switch can use a bright, normal-white Hue power-on behavior as the hardware fail-safe. After the bulbs reconnect, Hue Scene Recall can restore the last Hue scene that was actually selected before power was lost.
@@ -12,7 +21,7 @@ The integration deliberately stores **scene memory** separately from **power int
 
 - Last scene: e.g. `Arctic Aurora`
 - Desired power: `on` or `off`
-- Recall armed: whether the room still represents that Hue scene or has been manually changed away from it
+- Recall armed: whether a valid remembered Hue scene exists and is eligible for recovery
 
 `off` is never treated as a scene. If a room was intentionally off when power failed, recovery reasserts OFF instead of turning the room on to an old scene.
 
@@ -63,18 +72,25 @@ Because this is a standard Home Assistant `select`, an automation can use `selec
 When any enrolled room becomes unavailable because one or more Hue bulbs lose power, the integration preserves the room's pre-loss intent. Once **all** Hue bulbs in that room are available again and remain stable briefly:
 
 - desired power **OFF** → Hue Scene Recall turns the Hue room back OFF;
-- desired power **ON** + recall armed + remembered scene → Hue Scene Recall recalls the real Hue scene;
-- desired power unknown, or recall disarmed → it leaves the recovered state alone.
+- desired power **ON** + a valid remembered scene → Hue Scene Recall recalls the real Hue scene;
+- desired power unknown, or no valid remembered scene → it leaves the recovered state alone.
 
 The recovery delay is currently 2.5 seconds after all bulbs become available.
 
-## Manual divergence
+## Temporary adjustments and scene memory
 
-If Hue reports that a scene is no longer active while all room bulbs remain reachable and at least one remains on, Hue Scene Recall treats that as a deliberate manual change after a short settling delay and disarms automatic scene recall for that room.
+Hue Scene Recall deliberately follows Hue's own distinction between a temporary adjustment and a saved scene:
 
-Selecting another Hue scene—through the Hue app, the Home Assistant select, or an automation—arms recall again and updates the remembered scene.
+- **Set once / individual bulb adjustment:** changes the current lighting only. It does not replace or disarm the remembered scene.
+- **Select a Hue scene:** that scene becomes the remembered scene.
+- **Edit and save an existing Hue scene in Hue:** the remembered scene ID stays the same, and the next recovery uses the newly saved scene definition.
+- **Save a new scene and select it:** the new scene becomes the remembered scene.
 
-Turning the room off does **not** erase or disarm its last scene.
+This rule is intentionally origin-agnostic. Temporary light changes from the Hue app, Home Assistant, Apple Home, or an automation are all treated the same way: they can alter the current room state, but they do not redefine what should be restored after a power recovery.
+
+That avoids trying to infer whether a brightness/color change was a person, a dynamic-scene transition, an automation, or another controller. If a user wants a manual adjustment to survive future power recovery, the durable action is to save/update a Hue scene.
+
+Turning the whole room OFF also keeps the remembered scene. OFF is stored separately as power intent, not as a scene.
 
 ## Dynamic scenes
 
@@ -97,7 +113,7 @@ A direct Hue-app command can still affect any Hue lamp that remains continuously
 
 ## Hue rooms, not Hue zones
 
-v0.1.1 intentionally performs automatic reconciliation on Hue **rooms only**. Hue zones can overlap rooms and each other; automatically recalling overlapping zones could create conflicting commands. Zone support can be added later with explicit policy.
+v0.1.3 intentionally performs automatic reconciliation on Hue **rooms only**. Hue zones can overlap rooms and each other; automatically recalling overlapping zones could create conflicting commands. Zone support can be added later with explicit policy.
 
 ## Installation with HACS
 
@@ -126,8 +142,10 @@ Apache-2.0. See `LICENSE` and `NOTICE`.
 
 Hue can keep a bulb's last-known HA state for several seconds after mains power is removed. For short wall-switch power cycles that means an availability-only detector may never see `unavailable`.
 
-For any smart switch/relay that physically cuts power to a Hue room, add the **`hueRecallPower`** label to that switch and keep the room's existing room label on it (for example `isaacRoom`). Hue Scene Recall maps the relay to the room using that shared room label. While the relay is off it preserves the saved scene and suppresses false manual-divergence detection. When the relay returns on it waits for the Hue bulbs to rejoin and recalls the saved scene for the whole room, including continuously powered lamps in the same Hue room.
+For any smart switch/relay that physically cuts power to a Hue room, add the **`hueRecallPower`** label to that switch and keep the room's existing room label on it (for example `isaacRoom`). Hue Scene Recall maps the relay to the room using that shared room label. While the relay is off it preserves the saved scene. When the relay returns on it waits for the Hue bulbs to rejoin and recalls the saved scene for the whole room, including continuously powered lamps in the same Hue room.
 
-Only a **physical/manual OFF transition** starts a `hueRecallPower` recovery cycle. Relay changes initiated by Home Assistant automations or scripts (for example bedtime or occupancy logic) are ignored as power-loss signals, so an automation cannot accidentally cause a saved scene to be restored later. If a physical OFF started the cycle, the next ON completes recovery even when that ON was initiated by Home Assistant.
+Only a **physical/manual OFF transition observed while Hue Scene Recall is running** starts a `hueRecallPower` recovery cycle. Relay changes initiated by Home Assistant automations or scripts (for example bedtime or occupancy logic) carry a parent context and are ignored as power-loss signals, so an automation cannot accidentally cause a saved scene to be restored later. If a physical OFF started the cycle, the next ON completes recovery even when that ON was initiated by Home Assistant.
+
+v0.1.3 also deliberately does **not** infer a power cycle merely because a mapped relay is already OFF when Home Assistant starts or the topology refreshes. The integration did not observe the OFF edge or its context, and guessing could turn bedtime into a false outage. This favors not unexpectedly illuminating a room after restart.
 
 This label is optional. Normal/longer power outages are still handled through Hue-light availability recovery.
