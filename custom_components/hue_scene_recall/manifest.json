@@ -1,7 +1,7 @@
 {
   "domain": "hue_scene_recall",
   "name": "Hue Scene Recall",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "config_flow": true,
   "dependencies": [
     "hue"

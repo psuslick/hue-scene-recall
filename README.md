@@ -97,7 +97,7 @@ A direct Hue-app command can still affect any Hue lamp that remains continuously
 
 ## Hue rooms, not Hue zones
 
-v0.1.0 intentionally performs automatic reconciliation on Hue **rooms only**. Hue zones can overlap rooms and each other; automatically recalling overlapping zones could create conflicting commands. Zone support can be added later with explicit policy.
+v0.1.1 intentionally performs automatic reconciliation on Hue **rooms only**. Hue zones can overlap rooms and each other; automatically recalling overlapping zones could create conflicting commands. Zone support can be added later with explicit policy.
 
 ## Installation with HACS
 
@@ -121,3 +121,11 @@ The architecture follows the direction of Home Assistant PR #151883 (active Hue 
 ## License
 
 Apache-2.0. See `LICENSE` and `NOTICE`.
+
+### Short power cycles behind smart relays
+
+Hue can keep a bulb's last-known HA state for several seconds after mains power is removed. For short wall-switch power cycles that means an availability-only detector may never see `unavailable`.
+
+For any smart switch/relay that physically cuts power to a Hue room, add the **`hueRecallPower`** label to that switch and keep the room's existing room label on it (for example `isaacRoom`). Hue Scene Recall maps the relay to the room using that shared room label. While the relay is off it preserves the saved scene and suppresses false manual-divergence detection. When the relay returns on it waits for the Hue bulbs to rejoin and recalls the saved scene for the whole room, including continuously powered lamps in the same Hue room.
+
+This label is optional. Normal/longer power outages are still handled through Hue-light availability recovery.

@@ -49,6 +49,7 @@ class HueRecallMasterSwitch(SwitchEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         return {
             "label": "hueRecall",
+            "power_source_label": "hueRecallPower",
             "enrolled_rooms": sum(1 for room in self.manager.rooms.values() if room.enrolled),
             "total_rooms": len(self.manager.rooms),
             "behavior_when_off": "track_only_no_automatic_recovery",

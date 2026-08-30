@@ -91,11 +91,17 @@ class HueRecallSceneSelect(SelectEntity):
             "active_scene_id": room.active_scene_id,
             "scene_mode": room.resume_scene_mode,
             "desired_power": (
-                "on" if room.desired_on is True else "off" if room.desired_on is False else "unknown"
+                "on"
+                if room.desired_on is True
+                else "off"
+                if room.desired_on is False
+                else "unknown"
             ),
             "recall_armed": room.recall_armed,
             "recall_enrolled": room.enrolled,
             "master_enabled": self.manager.master_enabled,
+            "power_cycle_active": room.power_cycle_active,
+            "power_sources": list(room.power_entity_ids),
             "labeled_light_count": self.manager.labeled_light_count(self.room_id),
             "total_hue_lights": room.total_hue_lights,
             "hue_room_id": room.room_id,

@@ -23,7 +23,11 @@ from homeassistant.helpers.storage import Store
 
 from .const import (
     MANUAL_DIVERGENCE_DELAY,
+    POWER_RECOVERY_MAX_ATTEMPTS,
+    POWER_RECOVERY_RETRY_SECONDS,
+    POWER_RECOVERY_SETTLE_SECONDS,
     RECALL_LABEL_NAME,
+    RECALL_POWER_LABEL_NAME,
     RECOVERY_SETTLE_SECONDS,
     STATE_UNAVAILABLE_VALUES,
     STORAGE_KEY_PREFIX,
@@ -43,6 +47,7 @@ class RoomRecallState:
     room_id: str
     room_name: str
     light_entity_ids: tuple[str, ...] = ()
+    power_entity_ids: tuple[str, ...] = ()
     total_hue_lights: int = 0
     enrolled: bool = False
     all_available: bool = False
@@ -54,6 +59,8 @@ class RoomRecallState:
     recall_armed: bool = False
 
     reconciling: bool = False
+    power_cycle_active: bool = False
+    recovery_attempts: int = 0
     recovery_handle: asyncio.TimerHandle | None = field(default=None, repr=False)
     inactive_handle: asyncio.TimerHandle | None = field(default=None, repr=False)
 
@@ -76,8 +83,10 @@ class HueSceneRecallManager:
 
         self.master_enabled = True
         self.label_id: str | None = None
+        self.power_label_id: str | None = None
         self.rooms: dict[str, RoomRecallState] = {}
         self._entity_to_rooms: dict[str, set[str]] = {}
+        self._power_entity_to_rooms: dict[str, set[str]] = {}
         self._listeners: list[Listener] = []
         self._unsubs: list[Callable[[], None]] = []
         self._state_unsub: Callable[[], None] | None = None
@@ -111,6 +120,19 @@ class HueSceneRecallManager:
                 ),
             )
         self.label_id = label.label_id
+
+        power_label = label_registry.async_get_label_by_name(RECALL_POWER_LABEL_NAME)
+        if power_label is None:
+            power_label = label_registry.async_create(
+                RECALL_POWER_LABEL_NAME,
+                icon="mdi:power-plug",
+                description=(
+                    "Optional smart switch/relay whose power cycle should trigger Hue "
+                    "scene restoration for the matching hueRecall room. Match it to the "
+                    "room by sharing the room's HA label (for example isaacRoom)."
+                ),
+            )
+        self.power_label_id = power_label.label_id
 
         existing_tracker = getattr(self.bridge, "scene_activity_tracker", None)
         if isinstance(existing_tracker, SceneActivityTracker):
@@ -235,8 +257,15 @@ class HueSceneRecallManager:
         elif self.label_id and label_registry.async_get_label(self.label_id) is None:
             self.label_id = None
 
+        power_label = label_registry.async_get_label_by_name(RECALL_POWER_LABEL_NAME)
+        if power_label is not None:
+            self.power_label_id = power_label.label_id
+        elif self.power_label_id and label_registry.async_get_label(self.power_label_id) is None:
+            self.power_label_id = None
+
         current_room_ids: set[str] = set()
         entity_to_rooms: dict[str, set[str]] = {}
+        room_common_labels: dict[str, set[str]] = {}
 
         for hue_room in self.api.groups.room:
             room_id = hue_room.id
@@ -279,6 +308,18 @@ class HueSceneRecallManager:
                 )
             )
 
+            label_sets = [
+                set(entry.labels)
+                for entity_id in room.light_entity_ids
+                if (entry := ent_reg.async_get(entity_id)) is not None
+            ]
+            common_labels = set.intersection(*label_sets) if label_sets else set()
+            if self.label_id is not None:
+                common_labels.discard(self.label_id)
+            if self.power_label_id is not None:
+                common_labels.discard(self.power_label_id)
+            room_common_labels[room_id] = common_labels
+
             current_all_available = self._all_available(room)
             # A topology/label refresh establishes a fresh baseline. It must never
             # masquerade as an availability recovery and trigger a scene recall.
@@ -296,6 +337,57 @@ class HueSceneRecallManager:
                 room.resume_scene_mode = None
                 room.recall_armed = False
 
+        # Map optional hueRecallPower switches/relays to rooms using labels that
+        # are common to every Hue light in that room. Prefer room-unique labels
+        # so generic labels such as interiorLight cannot create ambiguous links.
+        power_entity_to_rooms: dict[str, set[str]] = {}
+        label_room_count: dict[str, int] = {}
+        for common_labels in room_common_labels.values():
+            for common_label in common_labels:
+                label_room_count[common_label] = label_room_count.get(common_label, 0) + 1
+
+        for room in self.rooms.values():
+            room.power_entity_ids = ()
+
+        if self.power_label_id is not None:
+            for entity_entry in ent_reg.entities.values():
+                if (
+                    not entity_entry.entity_id.startswith("switch.")
+                    or self.power_label_id not in entity_entry.labels
+                ):
+                    continue
+                entry_labels = set(entity_entry.labels)
+                candidates: list[tuple[int, str]] = []
+                for room_id, common_labels in room_common_labels.items():
+                    shared = entry_labels & common_labels
+                    if not shared:
+                        continue
+                    score = sum(100 if label_room_count[label] == 1 else 1 for label in shared)
+                    candidates.append((score, room_id))
+                if not candidates:
+                    _LOGGER.warning(
+                        "hueRecallPower entity %s does not share a room label with any Hue room",
+                        entity_entry.entity_id,
+                    )
+                    continue
+                best_score = max(score for score, _ in candidates)
+                best_rooms = [room_id for score, room_id in candidates if score == best_score]
+                if len(best_rooms) != 1:
+                    _LOGGER.warning(
+                        "hueRecallPower entity %s maps ambiguously to Hue rooms %s",
+                        entity_entry.entity_id,
+                        best_rooms,
+                    )
+                    continue
+                room_id = best_rooms[0]
+                power_entity_to_rooms.setdefault(entity_entry.entity_id, set()).add(room_id)
+
+        for entity_id, room_ids in power_entity_to_rooms.items():
+            for room_id in room_ids:
+                room = self.rooms.get(room_id)
+                if room is not None:
+                    room.power_entity_ids = tuple(sorted((*room.power_entity_ids, entity_id)))
+
         removed_room_ids = set(self.rooms) - current_room_ids
         for room_id in removed_room_ids:
             room = self.rooms.pop(room_id)
@@ -304,6 +396,14 @@ class HueSceneRecallManager:
                 unsub()
 
         self._entity_to_rooms = entity_to_rooms
+        self._power_entity_to_rooms = power_entity_to_rooms
+        for room in self.rooms.values():
+            if room.power_entity_ids and any(
+                (state := self.hass.states.get(entity_id)) is not None
+                and state.state == STATE_OFF
+                for entity_id in room.power_entity_ids
+            ):
+                room.power_cycle_active = True
         self._reset_state_listener()
         self._schedule_save()
         self._notify()
@@ -313,10 +413,10 @@ class HueSceneRecallManager:
         if self._state_unsub:
             self._state_unsub()
             self._state_unsub = None
-        entity_ids = tuple(self._entity_to_rooms)
+        entity_ids = tuple(set(self._entity_to_rooms) | set(self._power_entity_to_rooms))
         if entity_ids:
             self._state_unsub = async_track_state_change_event(
-                self.hass, entity_ids, self._on_light_state_change
+                self.hass, entity_ids, self._on_state_change
             )
 
     @callback
@@ -351,7 +451,7 @@ class HueSceneRecallManager:
             self._notify()
             return
 
-        if room.reconciling:
+        if room.reconciling or room.power_cycle_active:
             self._notify()
             return
 
@@ -372,7 +472,7 @@ class HueSceneRecallManager:
         if room is None:
             return
         room.inactive_handle = None
-        if room.active_scene_id is not None or room.reconciling:
+        if room.active_scene_id is not None or room.reconciling or room.power_cycle_active:
             return
         if not self._all_available(room):
             # Unavailability can be power loss; preserve the last valid scene.
@@ -389,10 +489,57 @@ class HueSceneRecallManager:
         self._notify()
 
     @callback
-    def _on_light_state_change(self, event: Event) -> None:
+    def _on_state_change(self, event: Event) -> None:
         entity_id = event.data["entity_id"]
+        if entity_id in self._power_entity_to_rooms:
+            self._process_power_state_change(entity_id, event.data.get("new_state"))
         for room_id in tuple(self._entity_to_rooms.get(entity_id, ())):
             self._process_room_light_state(room_id)
+
+    @callback
+    def _process_power_state_change(self, entity_id: str, new_state: State | None) -> None:
+        if new_state is None or new_state.state not in (STATE_ON, STATE_OFF):
+            return
+        for room_id in tuple(self._power_entity_to_rooms.get(entity_id, ())):
+            room = self.rooms.get(room_id)
+            if room is None:
+                continue
+            if new_state.state == STATE_OFF:
+                room.power_cycle_active = True
+                room.recovery_attempts = 0
+                self._cancel_recovery_timer(room)
+                self._cancel_inactive_timer(room)
+                _LOGGER.debug(
+                    "Power source %s turned OFF for %s; preserving scene %s",
+                    entity_id,
+                    room.room_name,
+                    room.resume_scene_id,
+                )
+                self._notify()
+                continue
+
+            # With multiple mapped power sources, wait until all are back ON.
+            if any(
+                (state := self.hass.states.get(power_entity_id)) is not None
+                and state.state == STATE_OFF
+                for power_entity_id in room.power_entity_ids
+            ):
+                continue
+            if not room.power_cycle_active:
+                continue
+            room.recovery_attempts = 0
+            self._schedule_power_recovery(room, POWER_RECOVERY_SETTLE_SECONDS)
+            self._notify()
+
+    @callback
+    def _schedule_power_recovery(self, room: RoomRecallState, delay: float) -> None:
+        self._cancel_recovery_timer(room)
+        room.recovery_handle = self.hass.loop.call_later(
+            delay,
+            lambda: self.hass.async_create_task(
+                self.async_reconcile(room.room_id, reason="power_source_recovery")
+            ),
+        )
 
     @callback
     def _process_room_light_state(self, room_id: str) -> None:
@@ -402,6 +549,12 @@ class HueSceneRecallManager:
 
         current_all_available = self._all_available(room)
         previous_all_available = room.all_available
+
+        if room.power_cycle_active:
+            room.all_available = current_all_available
+            self._cancel_inactive_timer(room)
+            self._notify()
+            return
 
         if not current_all_available:
             room.all_available = False
@@ -436,13 +589,28 @@ class HueSceneRecallManager:
             self._notify()
 
     async def async_reconcile(self, room_id: str, *, reason: str) -> None:
-        """Reconcile one room after all of its labeled Hue lights recover."""
+        """Reconcile one room after availability or a known mains-power recovery."""
         room = self.rooms.get(room_id)
         if room is None:
             return
         room.recovery_handle = None
+        power_recovery = reason == "power_source_recovery"
 
-        if not self.master_enabled or not room.enrolled or not self._all_available(room):
+        if not self.master_enabled or not room.enrolled:
+            if power_recovery:
+                room.power_cycle_active = False
+                room.recovery_attempts = 0
+                self._notify()
+            return
+
+        if not self._all_available(room):
+            if power_recovery and room.recovery_attempts < POWER_RECOVERY_MAX_ATTEMPTS:
+                room.recovery_attempts += 1
+                self._schedule_power_recovery(room, POWER_RECOVERY_RETRY_SECONDS)
+            elif power_recovery:
+                room.power_cycle_active = False
+                room.recovery_attempts = 0
+                self._notify()
             return
 
         intent = room.desired_on
@@ -450,12 +618,16 @@ class HueSceneRecallManager:
             # First observation with no trustworthy pre-outage intent: learn current
             # state and do not change the room.
             room.desired_on = self._any_on(room)
+            if power_recovery:
+                room.power_cycle_active = False
+                room.recovery_attempts = 0
             self._schedule_save()
             self._notify()
             return
 
         room.reconciling = True
         self._notify()
+        failed = False
         try:
             if intent is False:
                 await self._async_set_room_power(room_id, False)
@@ -469,11 +641,19 @@ class HueSceneRecallManager:
                     reason,
                 )
         except Exception:  # noqa: BLE001 - HA bridge wrapper provides user-facing errors
+            failed = True
             _LOGGER.exception("Failed to reconcile Hue room %s", room.room_name)
         finally:
             room.reconciling = False
             room.all_available = self._all_available(room)
-            self._notify()
+
+        if power_recovery and failed and room.recovery_attempts < POWER_RECOVERY_MAX_ATTEMPTS:
+            room.recovery_attempts += 1
+            self._schedule_power_recovery(room, POWER_RECOVERY_RETRY_SECONDS)
+        elif power_recovery:
+            room.power_cycle_active = False
+            room.recovery_attempts = 0
+        self._notify()
 
     async def async_select_scene(self, room_id: str, scene_id: str) -> None:
         """Explicitly select a Hue scene; manual selection ignores master recovery OFF."""
@@ -612,7 +792,9 @@ class HueSceneRecallManager:
 
     def _all_off(self, room: RoomRecallState) -> bool:
         states = self._states(room)
-        return bool(states) and all(state is not None and state.state == STATE_OFF for state in states)
+        return bool(states) and all(
+            state is not None and state.state == STATE_OFF for state in states
+        )
 
     @callback
     def _on_scene_resource_event(
@@ -636,16 +818,23 @@ class HueSceneRecallManager:
     @callback
     def _on_entity_registry_update(self, event: Event) -> None:
         entity_id = event.data.get("entity_id", "")
-        if not entity_id.startswith("light."):
+        if not (entity_id.startswith("light.") or entity_id.startswith("switch.")):
             return
         entity_entry = er.async_get(self.hass).async_get(entity_id)
-        was_tracked = entity_id in self._entity_to_rooms
+        was_tracked = (
+            entity_id in self._entity_to_rooms or entity_id in self._power_entity_to_rooms
+        )
         is_our_hue_light = (
             entity_entry is not None
             and entity_entry.platform == "hue"
             and entity_entry.config_entry_id == self.hue_entry.entry_id
         )
-        if not was_tracked and not is_our_hue_light:
+        is_power_candidate = (
+            entity_entry is not None
+            and self.power_label_id is not None
+            and self.power_label_id in entity_entry.labels
+        )
+        if not was_tracked and not is_our_hue_light and not is_power_candidate:
             return
         self.hass.async_create_task(
             self.async_refresh_topology(),
