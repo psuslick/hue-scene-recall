@@ -1,151 +1,156 @@
-# Hue Scene Recall
+# Hue Scene Recall v0.2.1
 
-A Home Assistant custom integration that remembers the last real Philips Hue scene used in each Hue **room** and restores it after labeled Hue bulbs recover from mains power loss.
+Hue Scene Recall restores the **Hue Bridge's scene intent** after a labeled Hue room recovers from either of the two failure signals requested for recovery:
 
-It is built on `aiohue`'s `SceneActivityTracker` (available in Home Assistant 2026.8+ through `aiohue 4.9.0`) and reuses Home Assistant's already-authenticated local Hue V2 connection. It does **not** create a second Hue Bridge login, poll the cloud, or copy Hue scene definitions into Home Assistant.
+1. Home Assistant reports one of the room's Hue lights as `unavailable`/`unknown`.
+2. The Hue Bridge reports that light's `zigbee_connectivity.status` as `connectivity_issue`.
 
-## v0.1.3 fixes
+These are independent recovery signals. Neither changes the scene source of truth: **Hue Bridge remains the only scene authority.**
 
-- Simplify sticky recall around Hue's own scene model: only selecting a Hue scene changes the remembered scene.
-- Temporary per-bulb changes from Hue, Home Assistant, Apple Home, or automations do not disarm or replace scene memory.
-- Upgrades ignore the legacy persisted `recall_armed: false` value from v0.1.2 and re-arm any still-valid remembered scene.
-- Startup/topology refresh no longer guesses that an already-OFF `hueRecallPower` relay represents a physical outage.
-- The manifest declares an explicit `integration_type` for current hassfest validation.
-- Local 256/512 px brand icons and dependency-free regression/repository checks are included for CI.
+## v0.2.1 recovery path
 
-## Why
+```text
+HA light unavailable/unknown ──────┐
+                                  ├─> arm room recovery
+Hue connectivity_issue ───────────┘
 
-Hue bulbs behind a relay or wall switch can use a bright, normal-white Hue power-on behavior as the hardware fail-safe. After the bulbs reconnect, Hue Scene Recall can restore the last Hue scene that was actually selected before power was lost.
+wait until every armed condition has cleared
+        ↓
+2.5 second settle
+        ↓
+one fresh Hue Bridge GET: /clip/v2/resource
+        ↓
+active Smart Scene? → recall the parent Smart Scene
+otherwise → recall the room's regular scene with newest Hue status.last_recall
+        ↓
+exit
+```
 
-The integration deliberately stores **scene memory** separately from **power intent**:
+A `connectivity_issue` does **not** send a recall while the light is impaired. It arms recovery. The recall is sent when Hue reports the issue cleared and the HA light is also available. Likewise, `unavailable` arms recovery and the recall waits for HA availability to return.
 
-- Last scene: e.g. `Arctic Aurora`
-- Desired power: `on` or `off`
-- Recall armed: whether a valid remembered Hue scene exists and is eligible for recovery
+If both signals occur during the same physical outage, v0.2.1 produces **one recovery**, after both have cleared. It does not recall twice.
 
-`off` is never treated as a scene. If a room was intentionally off when power failed, recovery reasserts OFF instead of turning the room on to an old scene.
+## Why add Hue connectivity as a trigger?
 
-## Enrollment: `hueRecall`
+Recorder history for Isaac's ceiling lights showed that HA typically does not mark the bulbs `unavailable` until roughly 1–2.5 minutes after their upstream physical switch removes power. Hue's `zigbee_connectivity` event stream can potentially expose the loss sooner.
 
-On first setup, the integration creates a Home Assistant entity label named **`hueRecall`** if it does not already exist.
+v0.2.1 therefore listens directly to aiohue's `zigbee_connectivity` resource updates rather than polling. `connectivity_issue` is the only Hue connectivity status that arms recovery in this build, matching the requested behavior. Other Hue statuses remain visible in diagnostics but do not independently trigger recall.
 
-Add `hueRecall` to the **individual Hue light entities** you want protected.
+## Recovery diagnostics / auditing
 
-For safety, automatic recovery is enabled for a Hue room only when **every Hue light in that Hue room**:
+v0.2.1 adds one enabled diagnostic sensor per Hue room:
 
-1. resolves to a Home Assistant Hue `light.*` entity, and
-2. has the `hueRecall` label.
+`<room> Hue Recall Recovery Diagnostics`
 
-Partially labeled rooms are tracked but are **not** automatically changed after recovery. This prevents recalling a room scene from unexpectedly changing unlabeled bulbs.
+Its state is one of:
+
+- `healthy`
+- `connectivity_issue`
+- `unavailable`
+- `connectivity_issue+unavailable`
+- `recovering`
+
+The entity is a normal Home Assistant diagnostic sensor, so Recorder can retain its state/attribute transitions. Its per-light attributes include:
+
+- current HA availability;
+- current Hue Zigbee connectivity status;
+- Hue connectivity resource ID;
+- `last_connectivity_issue_at`;
+- `last_connectivity_recovered_at`;
+- `last_ha_unavailable_at`;
+- `last_ha_available_at`;
+- counts of connectivity issues and HA-unavailable edges since the integration loaded.
+
+Room-level attributes also expose:
+
+- current pending recovery reasons;
+- last impairment timestamp/reason;
+- last recovery trigger (`connectivity_issue`, `unavailable`, or both);
+- last recovery-trigger timestamp;
+- last recovery result and scene.
+
+These diagnostics are **observational only**. They never determine which scene is recalled. The integration does not persist these timestamps into its own state store; Recorder is the audit trail.
+
+## Scene architecture remains unchanged from v0.2.0
+
+Hue remains authoritative for:
+
+- regular scene definitions;
+- regular scene `status.last_recall` metadata;
+- Smart Scene identity and active state;
+- Smart Scene schedules and current timeslot;
+- whether a regular scene is configured `auto_dynamic`.
+
+Hue Scene Recall does not cache brightness, color, soft ON/OFF state, or a local recovery scene.
+
+The following remain normal Hue operation and do not arm recovery:
+
+- soft `on → off`;
+- soft `off → on`;
+- brightness changes;
+- color changes;
+- ordinary scene changes;
+- Hue timers;
+- Smart Scene timeslot changes.
+
+## Smart Scenes / Golden Hours
+
+If Hue reports an active Smart Scene when the room recovers, the integration recalls the **parent Smart Scene**. Hue then chooses the correct current timeslot. It does not recall a cached child scene.
+
+## Regular scenes
+
+If no Smart Scene is active, the integration chooses the regular scene in that Hue room with the newest bridge-maintained `status.last_recall` timestamp and recalls Hue's current saved definition.
+
+## Enrollment
+
+The existing `hueRecall` entity label remains the enrollment mechanism. Automatic recovery is enabled for a Hue room only when every Hue light in that Hue room resolves to a Home Assistant Hue light entity and carries `hueRecall`.
+
+The legacy `hueRecallPower` label remains untouched but is not used by this integration.
 
 ## Entities
 
 ### `switch.hue_recall_automatic_recovery`
 
-Master automatic-recovery switch for the configured Hue bridge.
+Master automatic-recovery switch.
 
-- **ON:** enrolled rooms can automatically reconcile after light availability recovers.
-- **OFF:** scene activity and power intent continue to be tracked, but automatic recovery makes no changes.
-- Turning it back ON does **not** immediately change any light; it only rearms future recovery.
+### `<room> Hue Recall Scene`
 
-This is intended to be useful on an Actions/Admin dashboard.
+Manual Hue scene selector. The selected scene remains derived from Hue bridge metadata, not locally persisted recovery memory.
 
-### `<room> Hue Recall Scene` select
+### `<room> Hue Recall Recovery Diagnostics`
 
-One `select.*` entity is created for every Hue room. Its options are the live Hue scenes belonging to that room, including scenes later added in the Hue app.
+Recorder-friendly audit sensor described above.
 
-The selected option is the **sticky scene to recall**, not merely a snapshot of bulb colors. Selecting an option recalls the real scene on the Hue Bridge. Direct scene selection in the Hue app is observed through `SceneActivityTracker` and updates the sticky recall scene.
+## Storage
 
-Useful attributes include:
+The integration persists only the master automatic-recovery switch. It does not persist scene state, light state, ON/OFF intent, or audit timestamps.
 
-- `active_scene`
-- `desired_power`
-- `recall_armed`
-- `recall_enrolled`
-- `master_enabled`
-- `total_hue_lights`
+## Requirements
 
-Because this is a standard Home Assistant `select`, an automation can use `select.select_next` with cycling enabled for a wall-button "next scene" action.
+- Home Assistant 2026.8.0 or newer
+- Built-in Philips Hue integration using Hue V2
+- aiohue supplied by that Home Assistant release
 
-## Recovery behavior
+Home Assistant 2026.8 includes aiohue 4.9.0. That release exposes Hue V2 `zigbee_connectivity` resources through an event-driven controller, and the connectivity model includes `connected`, `disconnected`, `connectivity_issue`, `unidirectional_incoming`, and `pending_discovery` statuses.
 
-When any enrolled room becomes unavailable because one or more Hue bulbs lose power, the integration preserves the room's pre-loss intent. Once **all** Hue bulbs in that room are available again and remain stable briefly:
+## Installation
 
-- desired power **OFF** → Hue Scene Recall turns the Hue room back OFF;
-- desired power **ON** + a valid remembered scene → Hue Scene Recall recalls the real Hue scene;
-- desired power unknown, or no valid remembered scene → it leaves the recovered state alone.
+This ZIP is a **PROPOSED build artifact**. It has not been installed on the live Home Assistant instance.
 
-The recovery delay is currently 2.5 seconds after all bulbs become available.
+For HACS/repository deployment, replace the repository contents with this build, publish/tag `v0.2.1`, refresh HACS repository information, update Hue Scene Recall, then restart Home Assistant.
 
-## Temporary adjustments and scene memory
+## Validation included
 
-Hue Scene Recall deliberately follows Hue's own distinction between a temporary adjustment and a saved scene:
+The package includes regression checks for:
 
-- **Set once / individual bulb adjustment:** changes the current lighting only. It does not replace or disarm the remembered scene.
-- **Select a Hue scene:** that scene becomes the remembered scene.
-- **Edit and save an existing Hue scene in Hue:** the remembered scene ID stays the same, and the next recovery uses the newly saved scene definition.
-- **Save a new scene and select it:** the new scene becomes the remembered scene.
-
-This rule is intentionally origin-agnostic. Temporary light changes from the Hue app, Home Assistant, Apple Home, or an automation are all treated the same way: they can alter the current room state, but they do not redefine what should be restored after a power recovery.
-
-That avoids trying to infer whether a brightness/color change was a person, a dynamic-scene transition, an automation, or another controller. If a user wants a manual adjustment to survive future power recovery, the durable action is to save/update a Hue scene.
-
-Turning the whole room OFF also keeps the remembered scene. OFF is stored separately as power intent, not as a scene.
-
-## Dynamic scenes
-
-When `SceneActivityTracker` reports that the remembered regular Hue scene was running in `dynamic_palette` mode, automatic recovery recalls it dynamically. If a scene is edited later in the Hue app, Hue Scene Recall recalls the current scene definition from the bridge rather than replaying stale copied brightness/color values.
-
-Hue Smart Scenes are retained and recalled as Smart Scenes.
-
-## Bedtime / temporary overrides
-
-The intended pattern is that a temporary mode such as bedtime changes actual lighting without replacing the remembered Hue scene.
-
-For a room where a relay physically removes power from ceiling bulbs during bedtime:
-
-1. the remembered scene remains sticky;
-2. scene selections made in the Hue app can update the remembered scene;
-3. the powered-off bulbs cannot illuminate;
-4. when the bulbs are intentionally powered again, normal recovery recalls the newest remembered scene.
-
-A direct Hue-app command can still affect any Hue lamp that remains continuously powered. A local integration cannot prevent the Hue Bridge from executing a direct Hue-app command before Home Assistant observes it.
-
-## Hue rooms, not Hue zones
-
-v0.1.3 intentionally performs automatic reconciliation on Hue **rooms only**. Hue zones can overlap rooms and each other; automatically recalling overlapping zones could create conflicting commands. Zone support can be added later with explicit policy.
-
-## Installation with HACS
-
-1. Put this repository on GitHub.
-2. In HACS, add the repository as a custom repository of type **Integration**.
-3. Install **Hue Scene Recall**.
-4. Restart Home Assistant.
-5. Go to **Settings → Devices & services → Add integration** and add **Hue Scene Recall**.
-6. Label every Hue bulb in a room with `hueRecall` to enroll that room.
-
-Requires Home Assistant **2026.8.0 or newer** and the built-in Philips Hue integration using the Hue V2 API.
-
-## Compatibility note
-
-This integration intentionally reuses the built-in Hue integration's `ConfigEntry.runtime_data` bridge object. That avoids duplicate Hue connections and credentials, but it is an internal Home Assistant implementation detail. The access is isolated so it can be adapted if Home Assistant later exposes `SceneActivityTracker` officially.
-
-## Upstream work
-
-The architecture follows the direction of Home Assistant PR #151883 (active Hue scene per group) and the `aiohue` `SceneActivityTracker` added in 4.9.0. Hue Scene Recall is separate so it can provide sticky scene/power-loss behavior today without replacing or forking Home Assistant's built-in Hue integration.
-
-## License
-
-Apache-2.0. See `LICENSE` and `NOTICE`.
-
-### Short power cycles behind smart relays
-
-Hue can keep a bulb's last-known HA state for several seconds after mains power is removed. For short wall-switch power cycles that means an availability-only detector may never see `unavailable`.
-
-For any smart switch/relay that physically cuts power to a Hue room, add the **`hueRecallPower`** label to that switch and keep the room's existing room label on it (for example `isaacRoom`). Hue Scene Recall maps the relay to the room using that shared room label. While the relay is off it preserves the saved scene. When the relay returns on it waits for the Hue bulbs to rejoin and recalls the saved scene for the whole room, including continuously powered lamps in the same Hue room.
-
-Only a **physical/manual OFF transition observed while Hue Scene Recall is running** starts a `hueRecallPower` recovery cycle. Relay changes initiated by Home Assistant automations or scripts (for example bedtime or occupancy logic) carry a parent context and are ignored as power-loss signals, so an automation cannot accidentally cause a saved scene to be restored later. If a physical OFF started the cycle, the next ON completes recovery even when that ON was initiated by Home Assistant.
-
-v0.1.3 also deliberately does **not** infer a power cycle merely because a mapped relay is already OFF when Home Assistant starts or the topology refreshes. The integration did not observe the OFF edge or its context, and guessing could turn bedtime into a false outage. This favors not unexpectedly illuminating a room after restart.
-
-This label is optional. Normal/longer power outages are still handled through Hue-light availability recovery.
+- active Smart Scene priority and parent recall;
+- newest regular Hue `last_recall` selection;
+- Hue `auto_dynamic` preservation;
+- no local scene/power recovery memory;
+- direct Hue `zigbee_connectivity` event subscription;
+- `connectivity_issue` as an independent recovery-arming condition;
+- HA `unavailable` as an independent recovery-arming condition;
+- waiting until **all** active recovery conditions clear before recall;
+- one fresh full-resource Hue GET per recovery;
+- Recorder-friendly diagnostic entities/timestamps;
+- soft ON/OFF changes remaining excluded from recovery logic.

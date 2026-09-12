@@ -1,4 +1,4 @@
-"""Master automatic-recall switch."""
+"""Master automatic-recovery switch."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ async def async_setup_entry(
 
 
 class HueRecallMasterSwitch(SwitchEntity):
-    """Globally enable/disable automatic Hue scene recovery for one bridge."""
+    """Globally enable/disable Hue connectivity/availability scene recovery."""
 
     _attr_should_poll = False
     _attr_icon = "mdi:restore"
@@ -49,8 +49,12 @@ class HueRecallMasterSwitch(SwitchEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         return {
             "label": "hueRecall",
-            "power_source_label": "hueRecallPower",
-            "enrolled_rooms": sum(1 for room in self.manager.rooms.values() if room.enrolled),
+            "enrolled_rooms": sum(
+                1 for room in self.manager.rooms.values() if room.enrolled
+            ),
             "total_rooms": len(self.manager.rooms),
-            "behavior_when_off": "track_only_no_automatic_recovery",
+            "recovery_trigger": "hue_connectivity_issue_or_ha_unavailable_recovery",
+            "scene_source_of_truth": "hue_bridge",
+            "diagnostics": "per_room_recorder_sensor",
+            "behavior_when_off": "no_automatic_recovery",
         }

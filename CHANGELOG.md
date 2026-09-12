@@ -1,28 +1,41 @@
 # Changelog
 
-## 0.1.3 — 2026-08-30
+## 0.2.1 — 2026-09-12
 
-- Simplify sticky scene memory: only selecting a Hue scene replaces the remembered scene.
-- Treat per-bulb brightness/color/state changes as temporary overrides regardless of whether they originate in Hue, Home Assistant, Apple Home, or an automation.
-- Remove manual-divergence timers and HA-user-context disarming logic.
-- Ignore v0.1.2's legacy persisted disarmed flag on upgrade and re-arm any still-valid remembered scene.
-- Continue storing power intent separately, so turning a room OFF preserves its remembered scene.
-- Stop inferring a physical power cycle from a `hueRecallPower` relay that is merely already OFF during startup/topology refresh.
-- Preserve v0.1.2 Context handling: unparented/manual power-source OFF starts recovery; automation/script child OFF does not.
-- Add explicit `integration_type: service` for current hassfest config-flow validation.
-- Add local brand icons, dependency-free Context regression tests, and repository validation CI.
-- Remove Core-only `strings.json`; custom integrations ship English config-flow text from `translations/en.json`.
-- Move CI to Node-24-compatible `actions/checkout@v6` and `actions/setup-python@v6`.
+### PROPOSED build
 
-## 0.1.2 — 2026-08-30
+Extends the v0.2 Hue-authoritative recovery design with direct Hue Zigbee connectivity recovery and audit instrumentation.
 
-- Ignore automation/script-generated `hueRecallPower` OFF transitions by checking Home Assistant Context `parent_id`.
-- Preserve manual/unparented power-cycle recovery.
+- Added direct subscription to aiohue `zigbee_connectivity` resource events.
+- `connectivity_issue` now independently arms automatic scene recovery.
+- HA light `unavailable`/`unknown` remains an independent recovery-arming condition.
+- Recall is sent only when **all conditions that currently impair the room have cleared**.
+- If one outage produces both `connectivity_issue` and HA `unavailable`, only one scene recall is sent after both recover.
+- Recovery still performs exactly one fresh `GET /clip/v2/resource` and resolves the scene from Hue Bridge state at recovery time.
+- Added one per-room diagnostic sensor intended for Home Assistant Recorder auditing.
+- Diagnostic attributes record per-light connectivity-issue/recovery and HA unavailable/available timestamps plus room-level recovery-trigger timestamps.
+- Diagnostic data is not used to select a scene and is not persisted by Hue Scene Recall.
+- Soft ON/OFF, brightness, color, scene changes, timers, and Smart Scene timeslot changes remain excluded from recovery arming.
+- Only Hue `connectivity_issue` arms the Hue-connectivity path in this release. Other Hue connectivity statuses are observable but do not independently trigger recall.
 
-## 0.1.1 — 2026-08-30
+This build has not been installed on the live Home Assistant instance and therefore remains **PROPOSED**, not APPLIED or VERIFIED.
 
-- Add optional `hueRecallPower` smart-relay detection for short mains interruptions that Hue may not expose as unavailable.
+## 0.2.0 — 2026-09-12
 
-## 0.1.0 — 2026-08-30
+### PROPOSED build
 
-- Initial release.
+Architectural rewrite of automatic recovery.
+
+- Hue Bridge is the sole scene source of truth.
+- Automatic recovery triggers only after a real Hue room availability recovery.
+- Recovery performs one fresh `GET /clip/v2/resource` through Home Assistant's existing Hue V2 connection.
+- Active Smart Scene wins and its parent Smart Scene is recalled, allowing Hue to choose the current timeslot.
+- Otherwise the regular Hue scene with the newest `status.last_recall` for the room is recalled.
+- Regular scene contents are never copied into Home Assistant.
+- `auto_dynamic` is read from Hue and honored on regular-scene recall.
+- Removed persisted `resume_scene_id`, `resume_scene_mode`, and `desired_on` recovery state.
+- Removed `recall_armed` recovery semantics.
+- Removed soft ON/OFF state tracking.
+- Removed `hueRecallPower` relay-edge recovery logic. Existing labels are not deleted; they are simply ignored.
+- Preserved `hueRecall` enrollment, the automatic-recovery master switch, and room scene select entity.
+- Preserved legacy scene-ID attributes as Hue-derived compatibility aliases.

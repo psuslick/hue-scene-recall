@@ -1,4 +1,4 @@
-"""Hue room recall-scene select entities."""
+"""Hue room scene select entities."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from .manager import HueSceneRecallManager
 async def async_setup_entry(
     hass, entry: HueSceneRecallConfigEntry, async_add_entities: AddConfigEntryEntitiesCallback
 ) -> None:
-    """Set up a sticky recall-scene select for every Hue room."""
+    """Set up a Hue-authoritative scene select for every Hue room."""
     manager = entry.runtime_data
     added_room_ids: set[str] = set()
 
@@ -36,7 +36,7 @@ async def async_setup_entry(
 
 
 class HueRecallSceneSelect(SelectEntity):
-    """Select representing the sticky scene to recall for a Hue room."""
+    """Select exposing Hue's authoritative room scene identity."""
 
     _attr_should_poll = False
     _attr_icon = "mdi:palette"
@@ -85,23 +85,40 @@ class HueRecallSceneSelect(SelectEntity):
         if not self.available:
             return {}
         room = self.manager.rooms[self.room_id]
+        authoritative = self.manager.authoritative_scene_from_cache(self.room_id)
+        authoritative_id = authoritative[0] if authoritative else None
+        authoritative_name = authoritative[1] if authoritative else None
+        authoritative_type = authoritative[2] if authoritative else None
         return {
-            "active_scene": self.manager.scene_name(room.active_scene_id),
-            "recall_scene_id": room.resume_scene_id,
-            "active_scene_id": room.active_scene_id,
-            "scene_mode": room.resume_scene_mode,
-            "desired_power": (
-                "on"
-                if room.desired_on is True
-                else "off"
-                if room.desired_on is False
-                else "unknown"
-            ),
-            "recall_armed": room.recall_armed,
+            # Keep these legacy attribute names as compatibility aliases, but they
+            # are now bridge-derived rather than locally persisted recovery state.
+            "active_scene": authoritative_name,
+            "active_scene_id": authoritative_id,
+            "recall_scene_id": authoritative_id,
+            "authoritative_scene": authoritative_name,
+            "authoritative_scene_id": authoritative_id,
+            "authoritative_scene_type": authoritative_type,
+            "recovery_source": "fresh_hue_bridge_query",
             "recall_enrolled": room.enrolled,
             "master_enabled": self.manager.master_enabled,
-            "power_cycle_active": room.power_cycle_active,
-            "power_sources": list(room.power_entity_ids),
+            "recovering": room.recovering,
+            "all_available": room.all_available,
+            "connectivity_issue": room.connectivity_issue,
+            "recovery_impaired": room.impaired,
+            "pending_recovery_reasons": sorted(room.pending_recovery_reasons),
+            "last_recovery_trigger": room.last_recovery_trigger,
+            "last_recovery_trigger_at": (
+                room.last_recovery_trigger_at.isoformat()
+                if room.last_recovery_trigger_at
+                else None
+            ),
+            "last_recovery_scene": room.last_recovery_scene_name,
+            "last_recovery_scene_id": room.last_recovery_scene_id,
+            "last_recovery_scene_type": room.last_recovery_scene_type,
+            "last_recovery_at": (
+                room.last_recovery_at.isoformat() if room.last_recovery_at else None
+            ),
+            "last_recovery_result": room.last_recovery_result,
             "labeled_light_count": self.manager.labeled_light_count(self.room_id),
             "total_hue_lights": room.total_hue_lights,
             "hue_room_id": room.room_id,

@@ -23,13 +23,13 @@ class HueSceneRecallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Select the Home Assistant Hue bridge to augment."""
         configured = {
-            entry.data.get(CONF_HUE_ENTRY_ID)
-            for entry in self._async_current_entries()
+            entry.data.get(CONF_HUE_ENTRY_ID) for entry in self._async_current_entries()
         }
         hue_entries = [
             entry
             for entry in self.hass.config_entries.async_entries(HUE_DOMAIN)
-            if entry.entry_id not in configured and entry.data.get(CONF_API_VERSION, 1) == 2
+            if entry.entry_id not in configured
+            and entry.data.get(CONF_API_VERSION, 1) == 2
         ]
 
         if not hue_entries:
@@ -60,7 +60,5 @@ class HueSceneRecallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         choices = {entry.entry_id: entry.title for entry in hue_entries}
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
-                {vol.Required(CONF_HUE_ENTRY_ID): vol.In(choices)}
-            ),
+            data_schema=vol.Schema({vol.Required(CONF_HUE_ENTRY_ID): vol.In(choices)}),
         )

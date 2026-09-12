@@ -1,8 +1,6 @@
 Hue Scene Recall
-Copyright 2026
+Copyright 2026 psuslick
 
-This project is informed by the architecture and public implementation work in:
-- Home Assistant Core (Apache License 2.0), especially Philips Hue integration work and PR #151883.
-- aiohue (Apache License 2.0), especially SceneActivityTracker.
-
-No Philips Hue credentials are included in this repository.
+This product includes software developed for use with Home Assistant and the
+Philips Hue local V2 API through aiohue. Home Assistant, aiohue, and Philips Hue
+are separate projects/products and are not bundled with this package.
