@@ -4,19 +4,38 @@ from homeassistant.const import Platform
 
 DOMAIN = "hue_scene_recall"
 NAME = "Hue Scene Recall"
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 
 CONF_HUE_ENTRY_ID = "hue_entry_id"
 HUE_DOMAIN = "hue"
 RECALL_LABEL_NAME = "hueRecall"
 
-PLATFORMS = [Platform.SELECT, Platform.SWITCH, Platform.SENSOR]
+PLATFORMS = [Platform.SELECT, Platform.SWITCH, Platform.SENSOR, Platform.NUMBER]
 
 # Keep the existing Store version so v0.2.1's master_enabled value can be read.
 # v0.3 adds a backwards-compatible "controllers" mapping to the same payload.
 STORAGE_VERSION = 1
 STORAGE_KEY_PREFIX = DOMAIN
 STORAGE_SAVE_DELAY = 2
+
+# Brightness-cap persistence is deliberately separate from controller identity.
+# It stores only the user's cap and the original brightness values needed to
+# reverse a temporary Hue Scene overlay. It never stores power, color, schedule,
+# or recovery desired-state payloads.
+BRIGHTNESS_CAP_STORAGE_VERSION = 1
+BRIGHTNESS_CAP_STORAGE_KEY_PREFIX = f"{DOMAIN}.brightness_cap"
+BRIGHTNESS_CAP_MIN = 1.0
+BRIGHTNESS_CAP_MAX = 100.0
+BRIGHTNESS_CAP_DEFAULT = 100.0
+BRIGHTNESS_CAP_SCENE_SETTLE_SECONDS = 0.75
+BRIGHTNESS_CAP_LIGHT_SETTLE_SECONDS = 0.75
+BRIGHTNESS_CAP_INTERNAL_WRITE_SECONDS = 4.0
+# Same-active-Smart reapplication can emit intermediate transition events for
+# the Smart Scene transition duration. Keep those cap-generated events out of
+# HueRecall manual-controller classification, with a bounded settling margin.
+BRIGHTNESS_CAP_SMART_REAPPLY_GUARD_MARGIN_SECONDS = 15.0
+BRIGHTNESS_CAP_VERIFY_TIMEOUT_SECONDS = 1.5
+BRIGHTNESS_CAP_MAX_WRITE_ATTEMPTS = 2
 
 # Detailed diagnostics are RAM-first to minimize microSD writes. The separate
 # flight-recorder Store is checkpointed at most twice per day during normal

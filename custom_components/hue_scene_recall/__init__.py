@@ -7,6 +7,7 @@ from homeassistant.const import CONF_API_VERSION
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 
+from .brightness_cap import HueBrightnessCapController
 from .const import CONF_HUE_ENTRY_ID, PLATFORMS
 from .manager import HueSceneRecallManager
 
@@ -31,13 +32,23 @@ async def async_setup_entry(
     if getattr(bridge, "api_version", 1) != 2:
         raise ConfigEntryNotReady("Hue Scene Recall requires a Hue V2 bridge")
 
-    # The Hue runtime adapter is deliberately isolated here: v0.3 reuses the
-    # already-authenticated aiohue client/cache/SSE stream from HA rather than
-    # creating a second Hue connection.
+    # Reuse Home Assistant's already-authenticated aiohue client/cache/SSE
+    # stream rather than opening a second Hue connection.
     manager = HueSceneRecallManager(hass, entry, hue_entry, bridge)
     await manager.async_setup()
-    entry.runtime_data = manager
 
+    # The brightness cap is intentionally a separate coordinator. Recovery
+    # remains Bridge-authoritative and exact-light; the cap overlays saved Hue
+    # Scene brightness reversibly and uses direct light writes only when doing so
+    # cannot disrupt an active Smart Scene.
+    cap = HueBrightnessCapController(hass, entry, manager)
+    manager.brightness_cap = cap
+    try:
+        await cap.async_setup()
+    except Exception:
+        await manager.async_shutdown()
+        raise
+    entry.runtime_data = manager
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
@@ -48,5 +59,8 @@ async def async_unload_entry(
     """Unload Hue Scene Recall."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
+        cap = getattr(entry.runtime_data, "brightness_cap", None)
+        if cap is not None:
+            await cap.async_shutdown()
         await entry.runtime_data.async_shutdown()
     return unload_ok

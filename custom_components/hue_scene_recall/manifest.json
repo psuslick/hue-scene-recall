@@ -1,7 +1,7 @@
 {
   "domain": "hue_scene_recall",
   "name": "Hue Scene Recall",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "config_flow": true,
   "dependencies": ["hue"],
   "documentation": "https://github.com/psuslick/hue-scene-recall",
