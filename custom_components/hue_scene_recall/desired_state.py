@@ -1,4 +1,4 @@
-"""Fresh Bridge desired-state resolution for Hue Scene Recall v0.3.2."""
+"""Fresh Bridge desired-state resolution for Hue Scene Recall v0.3.3."""
 
 from __future__ import annotations
 

@@ -42,6 +42,7 @@ const = _load("const")
 controller = _load("controller_tracker")
 desired = _load("desired_state")
 compare = _load("compare")
+flight = _load("flight_recorder")
 
 ControllerRef = controller.ControllerRef
 resolve_desired_state = desired.resolve_desired_state
@@ -591,3 +592,75 @@ def test_episode_cross_day_after_first_daytime_boundary_re_resolves_schedule():
     assert out.status == "resolved"
     assert out.effective_scene_rid == SCENE_OLD
     assert "smart_episode_crossed_day_boundary" in out.reason
+
+
+def test_flight_recorder_is_bounded_and_non_authoritative():
+    recorder = flight.FlightRecorder(max_events=3)
+    for i in range(5):
+        recorder.record("evt", category="test", data={"i": i})
+    snap = recorder.snapshot()
+    assert snap["event_count"] == 3
+    assert [item["data"]["i"] for item in snap["events"]] == [2, 3, 4]
+    assert recorder.dirty is True
+
+
+def test_flight_recorder_persistence_round_trip_preserves_events_not_authority():
+    recorder = flight.FlightRecorder(max_events=10)
+    recorder.record(
+        "observed",
+        category="observation",
+        data={"observed_appearance": {"dimming": {"brightness": 50}, "on": {"on": True}}},
+    )
+    raw = recorder.serialize()
+    restored = flight.FlightRecorder(max_events=10)
+    restored.load(raw)
+    assert restored.snapshot()["event_count"] == 1
+    assert restored.dirty is False
+    # Recovery authority remains controller/Bridge based; the recorder is not
+    # accepted by resolve_desired_state and is never imported by desired_state.
+    assert "flight_recorder" not in (ROOT / "desired_state.py").read_text()
+
+
+def test_diagnostic_checkpoint_is_twice_daily_and_not_per_event():
+    assert const.DIAGNOSTIC_CHECKPOINT_SECONDS == 12 * 60 * 60
+    source = (ROOT / "manager.py").read_text()
+    record_start = source.index("    def _record_event(")
+    checkpoint_start = source.index("    @callback\n    def _schedule_diagnostic_checkpoint", record_start)
+    record_text = source[record_start:checkpoint_start]
+    assert "async_save" not in record_text
+    assert "_diagnostic_store.async_save" in source
+    assert "DIAGNOSTIC_CHECKPOINT_SECONDS" in source
+
+
+def test_clean_stop_and_unload_flush_dirty_flight_recorder():
+    source = (ROOT / "manager.py").read_text()
+    assert 'await self._flush_flight_recorder("home_assistant_stop")' in source
+    assert '"integration_unload"' in source
+    assert "async_listen_once(EVENT_HOMEASSISTANT_STOP" in source
+
+
+def test_connectivity_recovery_waits_for_exact_light_appearance_or_timeout():
+    source = (ROOT / "manager.py").read_text()
+    recover_pos = source.index("    async def _async_recover_light")
+    readiness_call = source.index("await self._await_post_connect_readiness", recover_pos)
+    fresh_read = source.index("current = await self._fresh_light", recover_pos)
+    assert readiness_call < fresh_read
+    assert const.POST_CONNECT_APPEARANCE_TIMEOUT_SECONDS >= 10
+    assert "post_connect_ready_event.set()" in source
+
+
+def test_post_connect_manual_guard_exceeds_live_delayed_report_window():
+    # Live v0.3.2 validation observed the real power-up appearance roughly 7 s
+    # after Hue reported connected. The classification guard must be comfortably
+    # longer and must participate in manual-override suppression.
+    assert const.POST_CONNECT_MANUAL_GUARD_SECONDS >= 20
+    source = (ROOT / "manager.py").read_text()
+    assert "manual_classification_guard_until" in source
+    assert "room.fault_episode_id is not None" in source
+
+
+def test_diagnostics_module_exposes_flight_recorder_snapshot():
+    source = (ROOT / "diagnostics.py").read_text()
+    assert "diagnostic_snapshot" in source
+    manager = (ROOT / "manager.py").read_text()
+    assert '"flight_recorder": self.flight_recorder.snapshot()' in manager

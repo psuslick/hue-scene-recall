@@ -4,7 +4,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "hue_scene_recall"
 NAME = "Hue Scene Recall"
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 
 CONF_HUE_ENTRY_ID = "hue_entry_id"
 HUE_DOMAIN = "hue"
@@ -18,13 +18,31 @@ STORAGE_VERSION = 1
 STORAGE_KEY_PREFIX = DOMAIN
 STORAGE_SAVE_DELAY = 2
 
+# Detailed diagnostics are RAM-first to minimize microSD writes. The separate
+# flight-recorder Store is checkpointed at most twice per day during normal
+# operation, and flushed on clean integration unload / Home Assistant stop.
+DIAGNOSTIC_STORAGE_KEY_PREFIX = f"{DOMAIN}.diagnostics"
+DIAGNOSTIC_STORAGE_VERSION = 1
+DIAGNOSTIC_CHECKPOINT_SECONDS = 12 * 60 * 60
+DIAGNOSTIC_MAX_EVENTS = 1000
+
 STATE_UNAVAILABLE_VALUES = {"unavailable", "unknown"}
 
-# Recovery is per exact Hue light. This is deliberately short: live validation
-# proved that the Bridge's connected event is sufficient to start a bounded
-# recovery transaction, while a separate post-connect Light SSE update is not
-# guaranteed.
+# Base settle for non-connectivity recovery paths. Physical-power recoveries
+# have an additional exact-light post-connect appearance-readiness gate below.
 RECOVERY_SETTLE_SECONDS = 1.0
+
+# Live physical-power validation proved Hue can report zigbee_connectivity=
+# connected several seconds before the Light resource carries its real power-up
+# appearance. For connectivity_issue recoveries, wait for an exact-light
+# appearance event; if none arrives, perform a bounded fallback read only after
+# this window.
+POST_CONNECT_APPEARANCE_TIMEOUT_SECONDS = 12.0
+
+# Delayed power-up reports must not be classified as manual overrides immediately
+# after a recovery. This is classification suppression only; it is never used as
+# desired-state authority.
+POST_CONNECT_MANUAL_GUARD_SECONDS = 20.0
 
 # Coalesce related Hue Scene/Smart Scene/Light events before deciding whether an
 # ordinary saved scene replaced a Smart Scene or a healthy unsaved appearance

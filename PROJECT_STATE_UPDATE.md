@@ -1,28 +1,25 @@
-# Ready-to-paste project state update
+# Hue Scene Recall project-state update — 2026-09-13
 
-## HA_DECISION_LOG
+## Current live state
 
-### SUPERSEDED — v0.3.1 independent sibling Smart Scene re-resolution during one outage
+- **APPLIED / FAILED VERIFICATION:** Hue Scene Recall v0.3.2 is installed.
+- v0.3.2 successfully captured the shared Smart Scene outage episode and performed one exact-light verified recovery, but incorrectly declared the other bulb `already_correct` from stale post-connect state.
+- Live evidence showed Hue can report `connected` about seven seconds before the bulb's real power-up appearance reaches the Light resource.
+- The delayed report then caused `healthy_unsaved_appearance_change` and cleared the controller journal.
 
-Live Basement Bathroom testing showed v0.3.1 could produce different results for two bulbs on the same physical outage: A19 01 successfully verified Golden Hours 5 → Sleepy, while A19 02 reconnected roughly a second later after the Smart parent had become inactive and aborted in the inactive post-midnight guard. Independent per-light actuation remains correct, but controller/timeslot identity must be shared across one outage episode.
+## PROPOSED — v0.3.3
 
-### PROPOSED — v0.3.2 volatile Smart Scene recovery episode
+- Add exact-light post-connect appearance readiness before pre-write comparison.
+- Wait for a material appearance event, with a 12-second bounded fallback from Hue reconnect.
+- Add a 20-second post-connect classification guard and keep the room fault episode alive through the guard.
+- Add a 1,000-event RAM-first diagnostic flight recorder.
+- Persist diagnostic history only when dirty every 12 hours and on clean HA stop / integration unload.
+- Expose full flight-recorder history through config-entry diagnostics.
+- Keep diagnostic appearance completely non-authoritative.
 
-When the first bulb in a Hue room becomes impaired, capture runtime-only Smart controller/timeslot/child identity. All siblings recovering from that same outage may use that shared identity while it remains schedule-valid. Re-pull the current child Scene definition and exact Light action for every write. Never persist appearance, power, actions, or the episode itself. Invalidate the episode on positive controller replacement, transition crossing, date-boundary ambiguity, or changed timeslot target. Actual dynamic-palette playback remains fail-closed because exact-light PUT cannot rejoin it without violating the no-whole-scene invariant.
+## Verification status
 
-Historical newest-`last_recall`, automatic whole-Scene recall, grouped-light writes, and local appearance caching remain REJECTED.
+- Static/unit/build verification: **33/33 tests PASS; compile PASS**.
+- Live v0.3.3 verification: **NOT APPLIED / NOT VERIFIED**.
 
-## HA_CURRENT_STATE
-
-### APPLIED but not fully VERIFIED — Hue Scene Recall v0.3.1
-
-v0.3.1 is loaded. Its first controlled Basement Bathroom outage produced one successful verified exact-light recovery and one sibling abort caused by Smart Scene activity-state race. Therefore its active-Smart resolver and exact-light actuator are partially VERIFIED, but complete multi-bulb outage recovery is not.
-
-## HA_OPEN_ITEMS
-
-- Install/reload v0.3.2.
-- Ensure Golden Hours 5 is positively active before the test.
-- Repeat one Basement Bathroom physical power-cycle and leave it on.
-- Verify diagnostics show one shared recovery episode and both bulbs complete consistently.
-- Confirm no automatic power write, Scene recall, or grouped-light write occurred.
-- Continue to fail closed for actual dynamic-palette playback until an exact-light, power-neutral Hue mechanism exists.
+After live v0.3.3 verification, mark the v0.3.2 reconnect-readiness assumption SUPERSEDED and update HA_CURRENT_STATE accordingly.

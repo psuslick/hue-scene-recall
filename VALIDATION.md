@@ -1,70 +1,67 @@
-# v0.3.2 validation record
+# v0.3.3 validation record
 
 Status of this artifact: **PROPOSED build; not APPLIED to live Home Assistant.**
 
-## Live v0.3.1 evidence that triggered this build
+## Live v0.3.2 evidence that triggered this build
 
-During the first controlled Basement Bathroom power cycle after v0.3.1 installation:
+Basement Bathroom outage at approximately 04:19–04:20 EDT:
 
-### Basement Bath A19 01
+- one shared recovery episode was correctly captured as Golden Hours 5 → Sunday timeslot 5 → Nighttime;
+- A19 02 Hue connectivity returned at ~04:20:27.394;
+- v0.3.2 evaluated A19 02 after the one-second settle and ended `already_correct` at ~04:20:28.947;
+- A19 01 connectivity returned at ~04:20:28.403;
+- A19 01 received the exact-light Nighttime appearance write and ended `verified` at ~04:20:30.419;
+- A19 02's real post-power-up appearance was not reported until ~04:20:34.394, roughly seven seconds after Hue had already said `connected`;
+- that delayed state was ~50% / 2732 K rather than the saved Nighttime appearance;
+- controller journal cleared at ~04:20:35.899 as `healthy_unsaved_appearance_change`.
 
-- impairment detected by HA unavailable + Hue connectivity issue;
-- reconnect detected;
-- controller: Golden Hours 5;
-- effective Scene: Sleepy;
-- exact-light recovery result: **verified**.
+Conclusion: the v0.3.2 shared episode fix worked, but `connected + 1 second` was not a trustworthy readiness gate and late power-up state could still be misclassified as a manual change.
 
-### Basement Bath A19 02
+## v0.3.3 correction
 
-- same physical outage, independent reconnect about one second later;
-- Smart parent had become inactive before this sibling resolved;
-- transaction ended `aborted_unresolved` with `inactive_smart_post_midnight_semantics_unverified`.
+For recoveries that include Hue `connectivity_issue`:
 
-Conclusion: v0.3.1's exact-light actuator/verification path works, but independent fresh controller resolution could diverge between sibling bulbs in one outage when Hue activity status changed between their recovery transactions.
+1. after the exact light returns `connected`, start/continue a per-light readiness wait;
+2. a material Hue Light appearance update for that exact RID completes readiness immediately;
+3. if none arrives, wait until 12 seconds after reconnect before using a fresh exact-light GET fallback;
+4. only then can pre-write comparison return `already_correct`;
+5. suppress manual-appearance classification through 20 seconds after reconnect;
+6. keep the room fault episode active through that guard before controller reconciliation resumes.
 
-## Live dynamic-capability clarification
+## Diagnostic flight recorder
 
-After Golden Hours 5 was explicitly reselected, HA exposed the active child as Nighttime and its Scene entity as dynamic-capable. Raw Hue Bridge state showed the actual Basement Bathroom Nighttime resource was:
-
-- `auto_dynamic = false`;
-- `status.active = static`;
-- exact saved actions around 39.52% with per-bulb XY values matching the live bulbs.
-
-Therefore multi-color palette capability is not treated as evidence of current dynamic playback.
-
-## v0.3.2 correction
-
-The first impairment in a room captures a runtime-only `SmartRecoveryEpisode` containing:
-
-- Smart controller RID;
-- active timeslot id;
-- child Scene RID;
-- captured child activation mode when known;
-- timestamp.
-
-The object contains no brightness/color/color-temperature/power and is not serialized.
-
-A sibling recovery may use that child identity after the Smart parent has passively become inactive, but the saved child Scene and exact-light action are still fetched fresh at execution time.
-
-Episode use fails or falls back safely if the controller/timeslot mapping changed, a transition boundary was crossed, capture happened in a transition, or a date boundary invalidated the episode.
+- bounded to 1,000 events in RAM;
+- separate non-authoritative diagnostics Store;
+- no per-event Store writes;
+- dirty-only checkpoint every 12 hours;
+- dirty flush on Home Assistant stop and integration unload/reload;
+- complete event history available through config-entry diagnostics;
+- full history is not copied into room diagnostic-sensor attributes.
 
 ## Build checks
 
-- dependency-light resolver/comparison/static-invariant tests: **26 passed**;
+- dependency-light resolver/comparison/flight-recorder/static-invariant tests: **33 passed**;
 - full Python `compileall`: PASS;
-- manifest/component version: `0.3.2`;
-- automatic recovery function contains no Scene recall, Smart Scene recall, or grouped-light actuator;
+- manifest/component version: `0.3.3`;
+- automatic recovery contains no Scene recall, Smart Scene recall, or grouped-light actuator;
 - automatic exact-light writer still targets `/clip/v2/resource/light/{rid}`;
 - automatic payload allowlist remains exactly `dimming`, `color`, `color_temperature`;
-- persistent Store serialization contains controller identity only; recovery episode/context is absent;
-- tests cover the exact sibling-race pattern, post-midnight shared episode, transition expiry/fallback, date-boundary handling, palette-rich static Scene support, and actual dynamic-palette fail-closed behavior.
+- detailed diagnostic writes occur only inside the checkpoint/flush method, not the event-record path;
+- checkpoint interval test confirms 12 hours;
+- clean HA stop and integration unload paths flush dirty diagnostics;
+- readiness wait occurs before the recovery pre-write exact-light comparison;
+- tests require the post-connect manual-classification guard to exceed the observed ~7-second live delayed-report window;
+- flight recorder is bounded and does not appear in `desired_state.py` recovery authority.
 
-## Live verification still required after installation
+## Live verification required after installation
 
-Repeat a controlled Basement Bathroom outage while Golden Hours 5 is active and inspect the diagnostics. Success criteria:
+Use normal operation or one controlled Basement Bathroom outage. Success criteria:
 
-- one room `recovery_episode` is shared during the outage;
-- both bulbs independently arm/reconnect;
-- both resolve the same effective saved child Scene unless a real schedule transition invalidates the episode;
-- both end `verified` or `already_correct` as appropriate;
-- no automatic `on`, Scene recall, Smart Scene recall, grouped-light write, or sibling power change occurs.
+- both bulbs share the same outage episode;
+- neither transaction evaluates `already_correct` from a stale immediate post-connect read;
+- an exact-light post-connect appearance event advances recovery when it arrives;
+- if no event arrives, the bounded timeout/fresh-read path is visible in diagnostics;
+- both bulbs end `verified` or genuinely `already_correct` against their real post-power-up state;
+- delayed Hue reports do not clear the controller journal;
+- the flight recorder contains correlated events sufficient to reconstruct the episode afterward;
+- no automatic power write, whole-Scene recall, Smart Scene recall, grouped-light write, or sibling power change occurs.

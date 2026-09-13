@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import logging
 from typing import Any
+from uuid import uuid4
 
 from aiohue.util import dataclass_to_dict
 from aiohue.v2.controllers.events import EventType
@@ -19,6 +20,7 @@ from aiohue.v2.models.zigbee_connectivity import (
 )
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import Event, HomeAssistant, State, callback
 from homeassistant.helpers import entity_registry as er, label_registry as lr
 from homeassistant.helpers.event import async_track_state_change_event
@@ -27,7 +29,13 @@ from homeassistant.helpers.storage import Store
 from .compare import appearance_fingerprint, appearance_matches
 from .const import (
     CONTROLLER_RECONCILE_SECONDS,
+    DIAGNOSTIC_CHECKPOINT_SECONDS,
+    DIAGNOSTIC_MAX_EVENTS,
+    DIAGNOSTIC_STORAGE_KEY_PREFIX,
+    DIAGNOSTIC_STORAGE_VERSION,
     MAX_RECOVERY_ATTEMPTS,
+    POST_CONNECT_APPEARANCE_TIMEOUT_SECONDS,
+    POST_CONNECT_MANUAL_GUARD_SECONDS,
     RECALL_LABEL_NAME,
     RECOVERY_RETRY_DELAY_SECONDS,
     RECOVERY_SETTLE_SECONDS,
@@ -44,6 +52,7 @@ from .desired_state import (
     capture_active_smart_episode,
     resolve_desired_state,
 )
+from .flight_recorder import FlightRecorder
 from .recovery_logic import (
     RecoveryReason,
     impairment_reasons,
@@ -82,6 +91,16 @@ def _scene_last_recall(scene: Any) -> datetime | None:
     return value if isinstance(value, datetime) else None
 
 
+def _diagnostic_appearance(raw: dict[str, Any]) -> dict[str, Any]:
+    """Return a compact observed appearance snapshot for diagnostics only."""
+    out: dict[str, Any] = {}
+    for key in ("on", "dimming", "color", "color_temperature"):
+        value = raw.get(key)
+        if isinstance(value, dict):
+            out[key] = value
+    return out
+
+
 @dataclass(slots=True)
 class LightRecoveryState:
     """Runtime recovery state for one exact Hue Light RID."""
@@ -101,6 +120,9 @@ class LightRecoveryState:
     task: asyncio.Task[Any] | None = field(default=None, repr=False)
     internal_expected_payload: dict[str, Any] | None = None
     internal_expected_until: datetime | None = None
+    post_connect_ready_event: asyncio.Event | None = field(default=None, repr=False)
+    post_connect_appearance_seen_at: datetime | None = None
+    manual_classification_guard_until: datetime | None = None
     status: str = "healthy"
 
     last_connectivity_issue_at: datetime | None = None
@@ -136,6 +158,8 @@ class RoomRecallState:
     material_change_pending: bool = False
     last_active_smart_context: SmartRecoveryEpisode | None = None
     recovery_episode: SmartRecoveryEpisode | None = None
+    fault_episode_id: str | None = None
+    episode_clear_handle: asyncio.TimerHandle | None = field(default=None, repr=False)
     last_controller_change_at: datetime | None = None
     last_controller_change_reason: str | None = None
 
@@ -178,9 +202,20 @@ class HueSceneRecallManager:
             f"{STORAGE_KEY_PREFIX}.{entry.entry_id}",
             atomic_writes=True,
         )
+        self.flight_recorder = FlightRecorder(max_events=DIAGNOSTIC_MAX_EVENTS)
+        self._diagnostic_store: Store[dict[str, Any]] = Store(
+            hass,
+            DIAGNOSTIC_STORAGE_VERSION,
+            f"{DIAGNOSTIC_STORAGE_KEY_PREFIX}.{entry.entry_id}",
+            atomic_writes=True,
+        )
+        self._diagnostic_checkpoint_handle: asyncio.TimerHandle | None = None
+        self._ha_stop_seen = False
 
     async def async_setup(self) -> None:
         stored = await self._store.async_load() or {}
+        diagnostic_stored = await self._diagnostic_store.async_load() or {}
+        self.flight_recorder.load(diagnostic_stored)
         self.master_enabled = bool(stored.get("master_enabled", True))
         controllers = stored.get("controllers", {})
         if isinstance(controllers, dict):
@@ -256,10 +291,27 @@ class HueSceneRecallManager:
                 lr.EVENT_LABEL_REGISTRY_UPDATED, self._on_label_registry_update
             )
         )
+        self._unsubs.append(
+            self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self._on_hass_stop)
+        )
+        self._schedule_diagnostic_checkpoint()
+        self._record_event(
+            "integration_setup",
+            category="lifecycle",
+            data={"version": "0.3.3", "restored_events": self.flight_recorder.summary()["event_count"]},
+        )
         self._schedule_save()
         self._notify()
 
     async def async_shutdown(self) -> None:
+        if self._diagnostic_checkpoint_handle:
+            self._diagnostic_checkpoint_handle.cancel()
+            self._diagnostic_checkpoint_handle = None
+        if not self._ha_stop_seen:
+            self._record_event("integration_shutdown", category="lifecycle")
+        await self._flush_flight_recorder(
+            "home_assistant_stop" if self._ha_stop_seen else "integration_unload"
+        )
         if self._state_unsub:
             self._state_unsub()
             self._state_unsub = None
@@ -268,6 +320,9 @@ class HueSceneRecallManager:
         self._unsubs.clear()
         for room in self.rooms.values():
             self._cancel_room_reconcile(room)
+            if room.episode_clear_handle:
+                room.episode_clear_handle.cancel()
+                room.episode_clear_handle = None
         for light in self.lights.values():
             self._cancel_light_work(light)
 
@@ -300,6 +355,80 @@ class HueSceneRecallManager:
                 for room_id, room in self.rooms.items()
                 if room.controller is not None
             },
+        }
+
+    def _record_event(
+        self,
+        event: str,
+        *,
+        category: str,
+        severity: str = "info",
+        room_id: str | None = None,
+        light_id: str | None = None,
+        transaction_id: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        room = self.rooms.get(room_id) if room_id else None
+        self.flight_recorder.record(
+            event,
+            category=category,
+            severity=severity,
+            room_id=room_id,
+            light_id=light_id,
+            episode_id=room.fault_episode_id if room else None,
+            transaction_id=transaction_id,
+            data=data,
+        )
+
+    @callback
+    def _schedule_diagnostic_checkpoint(self) -> None:
+        if self._diagnostic_checkpoint_handle:
+            self._diagnostic_checkpoint_handle.cancel()
+        self._diagnostic_checkpoint_handle = self.hass.loop.call_later(
+            DIAGNOSTIC_CHECKPOINT_SECONDS,
+            self._start_diagnostic_checkpoint,
+        )
+
+    @callback
+    def _start_diagnostic_checkpoint(self) -> None:
+        self._diagnostic_checkpoint_handle = None
+        self.hass.async_create_task(
+            self._async_diagnostic_checkpoint(),
+            name=f"{self.entry.domain}_diagnostic_checkpoint",
+        )
+
+    async def _async_diagnostic_checkpoint(self) -> None:
+        try:
+            await self._flush_flight_recorder("12h_checkpoint")
+        finally:
+            self._schedule_diagnostic_checkpoint()
+
+    async def _flush_flight_recorder(self, reason: str) -> None:
+        if not self.flight_recorder.dirty:
+            return
+        checkpoint_at = _now().isoformat()
+        payload = self.flight_recorder.serialize()
+        payload["last_persisted_at"] = checkpoint_at
+        payload["checkpoint_reason"] = reason
+        try:
+            await self._diagnostic_store.async_save(payload)
+        except Exception as err:  # noqa: BLE001 - keep RAM dirty if persistence fails
+            _LOGGER.warning("Hue Scene Recall diagnostic checkpoint failed: %s", err)
+            return
+        self.flight_recorder.mark_persisted(checkpoint_at)
+
+    async def _on_hass_stop(self, event: Event) -> None:
+        self._ha_stop_seen = True
+        self._record_event("home_assistant_stop", category="lifecycle")
+        await self._flush_flight_recorder("home_assistant_stop")
+
+    def diagnostic_snapshot(self) -> dict[str, Any]:
+        """Return non-authoritative diagnostics, including the RAM flight recorder."""
+        return {
+            "version": "0.3.3",
+            "master_enabled": self.master_enabled,
+            "flight_recorder": self.flight_recorder.snapshot(),
+            "rooms": {room_id: self.room_diagnostic_attributes(room_id) for room_id in self.rooms},
         }
 
     async def async_set_master_enabled(self, enabled: bool) -> None:
@@ -552,6 +681,17 @@ class HueSceneRecallManager:
         room.last_controller_change_reason = reason or (
             controller.reason if controller is not None else "cleared"
         )
+        self._record_event(
+            "controller_changed",
+            category="controller",
+            room_id=room.room_id,
+            severity="warning" if controller is None else "info",
+            data={
+                "reason": room.last_controller_change_reason,
+                "previous": previous.as_dict() if previous else None,
+                "current": controller.as_dict() if controller else None,
+            },
+        )
         self._schedule_save()
         self._notify()
 
@@ -591,6 +731,20 @@ class HueSceneRecallManager:
 
     def _ensure_room_recovery_episode(self, room: RoomRecallState) -> None:
         """Freeze one controller/child identity for all bulbs in this outage."""
+        if room.episode_clear_handle:
+            room.episode_clear_handle.cancel()
+            room.episode_clear_handle = None
+        if room.fault_episode_id is None:
+            room.fault_episode_id = uuid4().hex[:12]
+            self._record_event(
+                "recovery_episode_started",
+                category="recovery",
+                room_id=room.room_id,
+                data={
+                    "controller_kind": room.controller.kind if room.controller else None,
+                    "controller_rid": room.controller.rid if room.controller else None,
+                },
+            )
         if room.recovery_episode is not None:
             return
         controller = room.controller
@@ -609,9 +763,20 @@ class HueSceneRecallManager:
         context = room.last_active_smart_context
         if context is not None and context.controller_rid == controller.rid:
             room.recovery_episode = context
+            self._record_event(
+                "smart_recovery_context_captured",
+                category="recovery",
+                room_id=room.room_id,
+                data={
+                    "controller_rid": context.controller_rid,
+                    "timeslot_id": context.timeslot_id,
+                    "child_scene_rid": context.child_scene_rid,
+                    "child_activation_mode": context.child_activation_mode,
+                },
+            )
 
     def _maybe_clear_room_recovery_episode(self, room: RoomRecallState) -> None:
-        if room.recovery_episode is None:
+        if room.recovery_episode is None and room.fault_episode_id is None:
             return
         for light_id in room.hue_light_ids:
             light = self.lights.get(light_id)
@@ -619,11 +784,52 @@ class HueSceneRecallManager:
                 continue
             if light.armed or self._current_reasons(light):
                 return
+
+        # Keep the outage episode alive through the post-connect classification
+        # guard. Delayed Hue power-up reports can otherwise look like manual
+        # overrides after the exact-light transaction has already finished.
+        now = _now()
+        deadlines = [
+            light.manual_classification_guard_until
+            for light_id in room.hue_light_ids
+            if (light := self.lights.get(light_id)) is not None
+            and light.manual_classification_guard_until is not None
+            and light.manual_classification_guard_until > now
+        ]
+        if deadlines:
+            deadline = max(deadlines)
+            seconds = max(0.1, (deadline - now).total_seconds())
+            if room.episode_clear_handle:
+                room.episode_clear_handle.cancel()
+            room.episode_clear_handle = self.hass.loop.call_later(
+                seconds, lambda: self._clear_room_recovery_episode(room.room_id)
+            )
+            return
+        self._clear_room_recovery_episode(room.room_id)
+
+    @callback
+    def _clear_room_recovery_episode(self, room_id: str) -> None:
+        room = self.rooms.get(room_id)
+        if room is None:
+            return
+        room.episode_clear_handle = None
+        for light_id in room.hue_light_ids:
+            light = self.lights.get(light_id)
+            if light is not None and (light.armed or self._current_reasons(light)):
+                return
+        self._record_event(
+            "recovery_episode_completed",
+            category="recovery",
+            room_id=room_id,
+            data={"smart_context_present": room.recovery_episode is not None},
+        )
         room.recovery_episode = None
+        room.fault_episode_id = None
         room.fresh_regular_candidates.clear()
         room.material_change_pending = False
-        # Reconcile only after the whole outage episode is complete.
+        # Reconcile only after the whole outage episode and late-report guard are complete.
         self._schedule_controller_reconcile(room.room_id)
+        self._notify()
 
     @callback
     def _schedule_controller_reconcile(self, room_id: str) -> None:
@@ -662,7 +868,7 @@ class HueSceneRecallManager:
             self._notify()
             return
 
-        if room.recovery_episode is not None:
+        if room.fault_episode_id is not None:
             # Scene/Light events produced by a physical outage or by our first
             # exact-light repair are not controller replacement evidence for a
             # sibling still recovering from the same episode.
@@ -739,8 +945,20 @@ class HueSceneRecallManager:
         if new_unavailable:
             light.last_ha_unavailable_at = now
             light.ha_unavailable_count += 1
+            self._record_event(
+                "ha_light_unavailable",
+                category="impairment",
+                room_id=light.room_id,
+                light_id=light.hue_light_id,
+            )
         else:
             light.last_ha_available_at = now
+            self._record_event(
+                "ha_light_available",
+                category="recovery",
+                room_id=light.room_id,
+                light_id=light.hue_light_id,
+            )
         self._process_light_condition(light)
 
     @callback
@@ -781,8 +999,33 @@ class HueSceneRecallManager:
         if new_status == ConnectivityServiceStatus.CONNECTIVITY_ISSUE.value:
             light.last_connectivity_issue_at = now
             light.connectivity_issue_count += 1
+            light.post_connect_appearance_seen_at = None
+            light.post_connect_ready_event = asyncio.Event()
+            light.manual_classification_guard_until = None
+            self._record_event(
+                "connectivity_issue",
+                category="impairment",
+                room_id=light.room_id,
+                light_id=light.hue_light_id,
+                data={"connectivity_resource_id": light.connectivity_resource_id},
+            )
         elif was_pending and not light.connectivity_issue_pending:
             light.last_connectivity_recovered_at = now
+            light.manual_classification_guard_until = now + timedelta(
+                seconds=POST_CONNECT_MANUAL_GUARD_SECONDS
+            )
+            if light.post_connect_ready_event is None:
+                light.post_connect_ready_event = asyncio.Event()
+            self._record_event(
+                "connectivity_connected",
+                category="recovery",
+                room_id=light.room_id,
+                light_id=light.hue_light_id,
+                data={
+                    "appearance_timeout_seconds": POST_CONNECT_APPEARANCE_TIMEOUT_SECONDS,
+                    "manual_guard_seconds": POST_CONNECT_MANUAL_GUARD_SECONDS,
+                },
+            )
         self._process_light_condition(light)
 
     @callback
@@ -799,6 +1042,13 @@ class HueSceneRecallManager:
                 # Invalidate any settle/defer/write transaction immediately when
                 # this exact light becomes impaired again.
                 light.generation += 1
+                self._record_event(
+                    "light_impairment_armed",
+                    category="impairment",
+                    room_id=light.room_id,
+                    light_id=light.hue_light_id,
+                    data={"reasons": sorted(reasons), "generation": light.generation},
+                )
             light.status = "impaired"
             light.last_reason = "+".join(sorted(reasons))
             self._cancel_light_work(light, keep_running_task=True)
@@ -818,6 +1068,14 @@ class HueSceneRecallManager:
         generation = light.generation
         light.status = "settling"
         light.last_recovery_trigger_at = _now()
+        self._record_event(
+            "recovery_scheduled",
+            category="recovery",
+            room_id=light.room_id,
+            light_id=light.hue_light_id,
+            transaction_id=f"{light.hue_light_id}:{generation}",
+            data={"trigger_reasons": sorted(light.trigger_reasons)},
+        )
         light.settle_handle = self.hass.loop.call_later(
             RECOVERY_SETTLE_SECONDS,
             lambda: self._start_recovery_task(light.hue_light_id, generation),
@@ -835,6 +1093,74 @@ class HueSceneRecallManager:
             name=f"{self.entry.domain}_recover_{light_id}",
         )
 
+    async def _await_post_connect_readiness(
+        self, light: LightRecoveryState, generation: int
+    ) -> bool:
+        """Wait for trustworthy exact-light appearance after Hue reconnect."""
+        if "connectivity_issue" not in light.trigger_reasons:
+            return True
+        recovered_at = light.last_connectivity_recovered_at
+        if recovered_at is None:
+            return True
+        if (
+            light.post_connect_appearance_seen_at is not None
+            and light.post_connect_appearance_seen_at >= recovered_at
+        ):
+            return True
+
+        deadline = recovered_at + timedelta(seconds=POST_CONNECT_APPEARANCE_TIMEOUT_SECONDS)
+        remaining = (deadline - _now()).total_seconds()
+        if remaining <= 0:
+            self._record_event(
+                "post_connect_appearance_timeout",
+                category="anomaly",
+                severity="warning",
+                room_id=light.room_id,
+                light_id=light.hue_light_id,
+                transaction_id=f"{light.hue_light_id}:{generation}",
+                data={"fallback": "fresh_exact_light_read"},
+            )
+            return True
+
+        light.status = "waiting_for_fresh_appearance"
+        self._record_event(
+            "waiting_for_post_connect_appearance",
+            category="recovery",
+            room_id=light.room_id,
+            light_id=light.hue_light_id,
+            transaction_id=f"{light.hue_light_id}:{generation}",
+            data={"remaining_seconds": round(remaining, 3)},
+        )
+        self._notify()
+        event = light.post_connect_ready_event
+        if event is None:
+            event = light.post_connect_ready_event = asyncio.Event()
+        try:
+            async with asyncio.timeout(remaining):
+                await event.wait()
+            if generation != light.generation or self._current_reasons(light):
+                return False
+            self._record_event(
+                "post_connect_appearance_seen",
+                category="recovery",
+                room_id=light.room_id,
+                light_id=light.hue_light_id,
+                transaction_id=f"{light.hue_light_id}:{generation}",
+                data={"seen_at": _iso(light.post_connect_appearance_seen_at)},
+            )
+            return True
+        except TimeoutError:
+            self._record_event(
+                "post_connect_appearance_timeout",
+                category="anomaly",
+                severity="warning",
+                room_id=light.room_id,
+                light_id=light.hue_light_id,
+                transaction_id=f"{light.hue_light_id}:{generation}",
+                data={"fallback": "fresh_exact_light_read"},
+            )
+            return True
+
     async def _async_recover_light(self, light_id: str, generation: int) -> None:
         light = self.lights.get(light_id)
         if light is None or generation != light.generation:
@@ -849,6 +1175,11 @@ class HueSceneRecallManager:
             self._finish_light_transaction(light, "room_not_enrolled", "aborted_unresolved")
             return
         if self._current_reasons(light):
+            light.status = "impaired"
+            self._notify()
+            return
+
+        if not await self._await_post_connect_readiness(light, generation):
             light.status = "impaired"
             self._notify()
             return
@@ -880,6 +1211,23 @@ class HueSceneRecallManager:
                 smart_episode=room.recovery_episode,
             )
             self._record_desired(light, desired)
+            self._record_event(
+                "desired_state_resolved",
+                category="recovery",
+                severity="warning" if desired.status in {"unresolved", "no_controller"} else "info",
+                room_id=room.room_id,
+                light_id=light.hue_light_id,
+                transaction_id=f"{light.hue_light_id}:{generation}",
+                data={
+                    "attempt": attempt,
+                    "status": desired.status,
+                    "reason": desired.reason,
+                    "controller_kind": desired.controller_kind,
+                    "controller_rid": desired.controller_rid,
+                    "effective_scene_rid": desired.effective_scene_rid,
+                    "desired_appearance": desired.payload,
+                },
+            )
 
             if desired.status == "no_controller":
                 self._finish_light_transaction(light, desired.reason, "no_recoverable_controller")
@@ -903,6 +1251,19 @@ class HueSceneRecallManager:
                 self._finish_light_transaction(light, light.last_reason, "failed_unverified")
                 return
 
+            self._record_event(
+                "prewrite_observed_state",
+                category="recovery",
+                room_id=room.room_id,
+                light_id=light.hue_light_id,
+                transaction_id=f"{light.hue_light_id}:{generation}",
+                data={
+                    "attempt": attempt,
+                    "observed_appearance": _diagnostic_appearance(current),
+                    "desired_appearance": desired.payload,
+                },
+            )
+
             if not self._controller_matches_desired(room.controller, desired):
                 if attempt < MAX_RECOVERY_ATTEMPTS:
                     continue
@@ -910,6 +1271,14 @@ class HueSceneRecallManager:
                 return
 
             if appearance_matches(current, desired.payload):
+                self._record_event(
+                    "prewrite_already_correct",
+                    category="recovery",
+                    room_id=room.room_id,
+                    light_id=light.hue_light_id,
+                    transaction_id=f"{light.hue_light_id}:{generation}",
+                    data={"attempt": attempt},
+                )
                 self._finish_light_transaction(light, "desired_appearance_already_present", "already_correct")
                 return
 
@@ -919,6 +1288,14 @@ class HueSceneRecallManager:
                 return
 
             light.status = "writing"
+            self._record_event(
+                "exact_light_write_started",
+                category="recovery",
+                room_id=room.room_id,
+                light_id=light.hue_light_id,
+                transaction_id=f"{light.hue_light_id}:{generation}",
+                data={"attempt": attempt, "payload": desired.payload},
+            )
             light.internal_expected_payload = desired.payload
             light.internal_expected_until = _now() + timedelta(seconds=3)
             self._notify()
@@ -1083,6 +1460,21 @@ class HueSceneRecallManager:
         light.trigger_reasons.clear()
         light.status = "healthy" if not self._current_reasons(light) else "impaired"
         room = self.rooms.get(light.room_id)
+        self._record_event(
+            "recovery_transaction_finished",
+            category="recovery",
+            severity="warning" if result in {"failed_unverified", "aborted_unresolved"} else "info",
+            room_id=light.room_id,
+            light_id=light.hue_light_id,
+            transaction_id=f"{light.hue_light_id}:{light.generation}",
+            data={
+                "result": result,
+                "reason": reason,
+                "controller_kind": light.last_controller_kind,
+                "controller_rid": light.last_controller_rid,
+                "effective_scene_rid": light.last_effective_scene_rid,
+            },
+        )
         if room is not None:
             self._maybe_clear_room_recovery_episode(room)
         self._notify()
@@ -1112,7 +1504,21 @@ class HueSceneRecallManager:
             return True
         if self._current_reasons(light):
             return True
-        if light.status in {"impaired", "settling", "resolving", "retry_pending"}:
+        if light.status in {
+            "impaired",
+            "settling",
+            "waiting_for_fresh_appearance",
+            "resolving",
+            "writing",
+            "verifying",
+            "retry_pending",
+            "deferred",
+        }:
+            return True
+        if (
+            light.manual_classification_guard_until is not None
+            and _now() <= light.manual_classification_guard_until
+        ):
             return True
         return False
 
@@ -1143,6 +1549,31 @@ class HueSceneRecallManager:
             return
 
         recovery = self.lights.get(light_id)
+        if (
+            recovery is not None
+            and recovery.armed
+            and recovery.last_connectivity_recovered_at is not None
+            and _now() >= recovery.last_connectivity_recovered_at
+        ):
+            recovery.post_connect_appearance_seen_at = _now()
+            if recovery.post_connect_ready_event is not None:
+                recovery.post_connect_ready_event.set()
+            self._record_event(
+                "post_connect_light_appearance_event",
+                category="recovery",
+                room_id=recovery.room_id,
+                light_id=light_id,
+                transaction_id=f"{light_id}:{recovery.generation}",
+                data={"observed_appearance": _diagnostic_appearance(raw)},
+            )
+        elif recovery is not None:
+            self._record_event(
+                "light_appearance_changed",
+                category="observation",
+                room_id=recovery.room_id,
+                light_id=light_id,
+                data={"observed_appearance": _diagnostic_appearance(raw)},
+            )
         if recovery is not None and recovery.internal_expected_payload is not None:
             if (
                 recovery.internal_expected_until is not None
@@ -1162,7 +1593,7 @@ class HueSceneRecallManager:
             return
         room_id = self._light_to_room[light_id]
         room = self.rooms.get(room_id)
-        if room is None or room.recovery_episode is not None or not self._room_healthy(room):
+        if room is None or room.fault_episode_id is not None or not self._room_healthy(room):
             return
         room.material_change_pending = True
         self._schedule_controller_reconcile(room_id)
@@ -1231,8 +1662,8 @@ class HueSceneRecallManager:
                 child_activation_mode=_scene_active_value(scene),
             )
 
-        if room.recovery_episode is not None:
-            # A Smart Scene's child can emit a fresh last_recall during the
+        if room.fault_episode_id is not None:
+            # A Scene child can emit a fresh last_recall during the
             # same physical outage/recovery. Do not promote that child over the
             # shared pre-outage Smart controller.
             return
@@ -1315,7 +1746,7 @@ class HueSceneRecallManager:
     def room_diagnostic_state(self, room_id: str) -> str:
         room = self.rooms[room_id]
         states = [self.lights.get(light_id) for light_id in room.hue_light_ids]
-        if any(state and state.status in {"writing", "verifying", "resolving", "retry_pending"} for state in states):
+        if any(state and state.status in {"waiting_for_fresh_appearance", "writing", "verifying", "resolving", "retry_pending"} for state in states):
             return "recovering"
         if any(state and state.status == "deferred" for state in states):
             return "deferred"
@@ -1354,6 +1785,8 @@ class HueSceneRecallManager:
                 "trigger_reasons": sorted(state.trigger_reasons),
                 "last_connectivity_issue_at": _iso(state.last_connectivity_issue_at),
                 "last_connectivity_recovered_at": _iso(state.last_connectivity_recovered_at),
+                "post_connect_appearance_seen_at": _iso(state.post_connect_appearance_seen_at),
+                "manual_classification_guard_until": _iso(state.manual_classification_guard_until),
                 "last_ha_unavailable_at": _iso(state.last_ha_unavailable_at),
                 "last_ha_available_at": _iso(state.last_ha_available_at),
                 "last_recovery_trigger_at": _iso(state.last_recovery_trigger_at),
@@ -1390,6 +1823,14 @@ class HueSceneRecallManager:
                 if room.recovery_episode is not None
                 else None
             ),
+            "fault_episode_id": room.fault_episode_id,
+            "flight_recorder": {
+                "dirty": self.flight_recorder.dirty,
+                "event_count": self.flight_recorder.summary()["event_count"],
+                "max_events": DIAGNOSTIC_MAX_EVENTS,
+                "last_persisted_at": self.flight_recorder.last_persisted_at,
+                "checkpoint_interval_hours": DIAGNOSTIC_CHECKPOINT_SECONDS / 3600,
+            },
             "lights": lights,
         }
 

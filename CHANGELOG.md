@@ -1,37 +1,45 @@
 # Changelog
 
-## 0.3.2 — shared Smart Scene outage episode / sibling-race fix
+## 0.3.3 — post-connect readiness + RAM-first diagnostic flight recorder
 
-### Fixed
+### Fixed from live v0.3.2 validation
 
-- Added a volatile per-room Smart Scene recovery episode so bulbs recovering from the same physical outage use one consistent pre-outage controller/timeslot/child identity.
-- Fixed the live v0.3.1 race where Basement Bath A19 01 verified against Golden Hours 5 → Sleepy, then A19 02 re-resolved after Hue passively marked the Smart parent inactive and aborted.
-- Suppressed Scene-child `last_recall` and appearance-change controller classification while a recovery episode is active, preventing recovery-generated events from replacing the Smart controller mid-episode.
-- Delayed normal controller reconciliation until all affected bulbs in the room are no longer impaired/armed.
-- Added episode invalidation on positive controller replacement/clear.
+- Hue `zigbee_connectivity=connected` is no longer treated as proof that the Light resource already contains the bulb's real power-up appearance.
+- Connectivity-triggered recovery now waits for the **exact recovered Light RID** to emit a material appearance update after reconnect.
+- If no such appearance update arrives, recovery fails over to a bounded fresh-read path only after **12 seconds** from Hue reconnect.
+- `already_correct` therefore cannot be decided from the one-second stale Bridge window that failed live in v0.3.2.
+- Delayed power-up appearance reports are protected by a **20-second post-connect manual-classification guard** so they cannot be mistaken for an unsaved user adjustment and erase the controller journal.
+- The room outage episode remains active through that guard before controller reconciliation resumes.
 
-### Schedule safety
+### Passive diagnostics / flight recorder
 
-- Episode identity is valid only while its Smart controller/timeslot/child mapping remains current and no transition start (`B-D`) has been crossed.
-- Episodes never cross a Bridge-local calendar-day boundary as authority.
-- When an episode expires, v0.3.2 re-resolves current inactive Smart schedule state where supported rather than blindly reusing the captured child.
-- The existing fail-closed post-midnight inactive-Smart guard remains when current Hue semantics cannot be reconstructed safely.
+- Added a bounded **1,000-event RAM flight recorder**.
+- Events include impairment/reconnect lifecycle, shared outage episode identity, controller changes, desired-state resolution, observed pre-write appearance, exact-light write/verification milestones, transaction outcomes, appearance-readiness timeouts, and anomalies.
+- Observed appearance can include power/brightness/color for diagnostics, but the recorder is **strictly non-authoritative** and is never consulted by desired-state resolution.
+- Added config-entry `diagnostics.py` support so the complete in-memory/persisted flight recorder can be retrieved later without putting the full log into entity attributes or Home Assistant Recorder.
 
-### Dynamic Scene handling
+### microSD write policy
 
-- Clarified that HA's palette-derived `is_dynamic` indication is not runtime dynamic-playback evidence.
-- Static Scene activation remains recoverable even when a Scene has a multi-color palette.
-- Actual `dynamic_palette` activation fails closed because an exact Light PUT cannot rejoin Hue dynamic Scene playback without a whole-Scene recall.
-- `auto_dynamic=true` remains fail-closed unless positive static activation evidence exists.
+- Detailed diagnostic events stay in RAM during ordinary operation.
+- The diagnostic Store writes only when dirty at a **12-hour checkpoint** (twice daily during continuous operation).
+- A dirty diagnostic buffer is also flushed on clean Home Assistant stop or integration unload/reload.
+- There are no per-event diagnostic disk writes.
+- The existing small controller journal remains separate; this release does not turn diagnostic appearance history into recovery state.
 
 ### Preserved safety invariants
 
 - Automatic recovery never writes `on`.
 - Automatic recovery never recalls a Scene or Smart Scene.
 - Automatic recovery never writes a grouped light.
-- Each actuator write still targets only the exact recovered Light RID.
-- Recovery episodes persist no appearance values and are never written to storage.
-- Saved Scene definitions are re-pulled from the Bridge at every recovery/retry.
+- Each actuator write targets only the exact recovered Hue Light RID.
+- Saved Scene actions are still pulled fresh from the Bridge at execution time.
+- Recovery episode identity is runtime-only and contains no appearance values.
+
+## 0.3.2 — shared Smart Scene outage episode / sibling-race fix
+
+- Added a volatile shared Smart Scene recovery episode so sibling bulbs use one pre-outage controller/timeslot/child identity.
+- Fixed the v0.3.1 sibling race where the first repair could make the Smart parent inactive before the second bulb resolved.
+- Corrected palette-capability versus actual `dynamic_palette` playback handling.
 
 ## 0.3.1 — active Smart Scene overnight resolver correction
 
