@@ -175,7 +175,7 @@ def test_inactive_smart_ignores_stale_active_timeslot_and_uses_schedule():
     assert out.payload == {"dimming": {"brightness": 25}}
 
 
-def test_active_smart_requires_timeslot_consistency():
+def test_active_smart_bridge_timeslot_is_authoritative_over_calendar_schedule():
     resources = _base_resources(
         _smart(state="active", active_id=3),
         _scene(SCENE_OLD, 44),
@@ -188,8 +188,64 @@ def test_active_smart_requires_timeslot_consistency():
         controller=ControllerRef("smart_scene", SMART),
         now=datetime(2026, 9, 12, 22, 5, tzinfo=TZ),
     )
+    assert out.status == "resolved"
+    assert out.effective_scene_rid == SCENE_OLD
+    assert out.payload == {"dimming": {"brightness": 44}}
+
+
+def test_active_smart_previous_weekday_after_midnight_resolves_reported_child():
+    # Regression for the first live v0.3.0 recovery test: at 03:35 Sunday
+    # the Bridge reported Golden Hours active_timeslot id=4, weekday=Saturday.
+    # That is valid Hue carry-forward state and must resolve the id=4 child.
+    resources = _base_resources(
+        _smart(state="active", active_id=4),
+        _scene(SCENE_OLD, 44),
+        _scene(SCENE_NEW, 25),
+    )
+    out = resolve_desired_state(
+        resources,
+        room_id=ROOM,
+        light_id=LIGHT_A,
+        controller=ControllerRef("smart_scene", SMART),
+        now=datetime(2026, 9, 13, 3, 35, tzinfo=TZ),
+    )
+    assert out.status == "resolved"
+    assert out.effective_scene_rid == SCENE_NEW
+    assert out.payload == {"dimming": {"brightness": 25}}
+
+
+def test_inactive_smart_post_midnight_fails_closed_until_semantics_verified():
+    resources = _base_resources(
+        _smart(state="inactive", active_id=4),
+        _scene(SCENE_OLD, 44),
+        _scene(SCENE_NEW, 25),
+    )
+    out = resolve_desired_state(
+        resources,
+        room_id=ROOM,
+        light_id=LIGHT_A,
+        controller=ControllerRef("smart_scene", SMART),
+        now=datetime(2026, 9, 13, 3, 35, tzinfo=TZ),
+    )
     assert out.status == "unresolved"
-    assert "active_timeslot" in out.reason
+    assert out.reason == "inactive_smart_post_midnight_semantics_unverified"
+
+
+def test_active_smart_invalid_timeslot_id_fails_closed():
+    resources = _base_resources(
+        _smart(state="active", active_id=99),
+        _scene(SCENE_OLD, 44),
+        _scene(SCENE_NEW, 25),
+    )
+    out = resolve_desired_state(
+        resources,
+        room_id=ROOM,
+        light_id=LIGHT_A,
+        controller=ControllerRef("smart_scene", SMART),
+        now=datetime(2026, 9, 13, 3, 35, tzinfo=TZ),
+    )
+    assert out.status == "unresolved"
+    assert out.reason == "active_timeslot_id_missing_from_schedule"
 
 
 def test_smart_transition_defers_from_boundary_minus_duration_through_settle():

@@ -1,21 +1,36 @@
-# v0.3.0 validation record
+# v0.3.1 validation record
 
-Status of this artifact: **APPROVED build; not APPLIED to live Home Assistant.**
+Status of this artifact: **PROPOSED build; not APPLIED to live Home Assistant.**
 
-## Source reconciliation
+## Live v0.3.0 failure that triggered this patch
 
-The installed v0.2.1 source was read from `/config/custom_components/hue_scene_recall` before this build. v0.2.1 was confirmed to:
+The first controlled Basement Bathroom power-cycle test on the APPLIED v0.3.0 build verified that both exact bulbs independently armed on HA `unavailable` + Hue `connectivity_issue`, then independently triggered recovery when HA returned available and Hue returned `connected`.
 
-- arm recovery at Hue-room scope;
-- wait for all room impairments to clear;
-- wait 2.5 seconds;
-- GET the full Hue resource tree;
-- choose an active Smart Scene, else the regular Scene with newest historical `last_recall`;
-- perform a parent Smart Scene or whole regular Scene recall.
+Both transactions then stopped before any write with:
 
-v0.3.0 intentionally replaces those automatic-recovery behaviors.
+```text
+aborted_unresolved
+active_timeslot_weekday_conflicts_with_schedule
+```
 
-## Live Bridge findings encoded by the implementation
+Live state at the time showed:
+
+- local time: about 03:35 Sunday, America/New_York;
+- controller: Golden Hours 5 (`smart_scene` RID `1ab1a166-9067-4182-80fd-f695da1c6665`);
+- Smart Scene state: active;
+- Bridge active timeslot: id `4`, weekday `saturday`;
+- active child exposed by HA Hue: **Sleepy**;
+- both bulbs had returned from power-up around 50% rather than the saved Sleepy appearance (~25.29% with per-bulb saved color).
+
+This proves v0.3.0's current-calendar-weekday equality check was invalid. The impairment/reconnect machinery was reached and worked; the desired-state resolver aborted before the actuator.
+
+## v0.3.1 resolver rule
+
+- If the stored Smart Scene is **active**, use Hue's live `active_timeslot.timeslot_id` as authoritative after confirming that original timeslot index still exists and targets a Scene in the current Smart Scene definition. Do not require `weekday` to match today's calendar weekday and do not require the active id to match a locally calculated child.
+- If the stored Smart Scene is **inactive**, continue ignoring `active_timeslot` because it can be stale. The schedule resolver remains supported outside the newly identified unverified post-midnight carry-forward interval.
+- For inactive Smart Scenes after the explicit 00:00 boundary and before the next non-midnight boundary, fail closed with `inactive_smart_post_midnight_semantics_unverified`.
+
+## Prior live findings still encoded
 
 - Inactive Smart Scene `active_timeslot` can be stale and is not used.
 - Active Smart Scene and active regular child can coexist; child `last_recall` cannot replace an active Smart parent.
@@ -28,18 +43,19 @@ v0.3.0 intentionally replaces those automatic-recovery behaviors.
 
 ## Build checks
 
-- Python compileall: pass.
-- JSON parse for `manifest.json` and `hacs.json`: pass.
-- Dependency-light resolver/comparison/static-invariant tests: 13 pass.
-- Static recovery-actuator inspection: no Scene recall or grouped-light actuator inside automatic recovery.
-- Automatic payload allowlist: `dimming`, `color`, `color_temperature`; `on` excluded.
+- Resolver/comparison/static-invariant tests: **16 pass**.
+- Includes exact overnight active-Smart regression test.
+- Includes inactive post-midnight fail-closed regression test.
+- Includes invalid active timeslot index fail-closed test.
+- Automatic payload allowlist remains `dimming`, `color`, `color_temperature`; `on` excluded.
+- Static automatic-recovery inspection continues to prohibit Scene recall and grouped-light actuation.
 
 ## Not yet verified
 
-Because this artifact has not been installed, the following remain **APPLIED/VERIFIED pending**:
+v0.3.1 still requires a new controlled live outage after installation to verify the complete path:
 
-- Home Assistant runtime import/setup of v0.3.0;
-- live persistence migration from the existing v0.2.1 Store payload;
-- live per-light recovery write/verification against the Bridge;
-- live diagnostics entity behavior after upgrade;
-- HACS installation/update flow for the published repository commit/tag.
+```text
+impairment → reconnect → active Smart child resolution → exact-light appearance PUT → verification
+```
+
+Until that succeeds, end-to-end automatic recovery remains **not VERIFIED**.

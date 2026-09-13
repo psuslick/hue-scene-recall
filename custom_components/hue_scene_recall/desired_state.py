@@ -1,4 +1,4 @@
-"""Fresh Bridge desired-state resolution for Hue Scene Recall v0.3."""
+"""Fresh Bridge desired-state resolution for Hue Scene Recall v0.3.1."""
 
 from __future__ import annotations
 
@@ -305,10 +305,6 @@ def resolve_desired_state(
     timezone = _bridge_timezone(resources)
     assert timezone is not None
     local_now = now.astimezone(timezone)
-    eligible = [item for item in boundaries if item[0] <= local_now]
-    if not eligible:
-        return DesiredState(status="unresolved", reason="no_current_timeslot")
-    _, timeslot_id, target_rid = max(eligible, key=lambda item: item[0])
 
     if smart.get("state") == "active":
         active = smart.get("active_timeslot")
@@ -318,13 +314,41 @@ def resolve_desired_state(
             active_id = int(active.get("timeslot_id"))
         except (TypeError, ValueError):
             return DesiredState(status="unresolved", reason="invalid_active_timeslot_id")
-        active_weekday = active.get("weekday")
-        if active_weekday != local_now.strftime("%A").lower():
-            return DesiredState(status="unresolved", reason="active_timeslot_weekday_conflicts_with_schedule")
-        if active_id != timeslot_id:
-            return DesiredState(status="unresolved", reason="active_timeslot_conflicts_with_schedule")
-    # When inactive, active_timeslot is deliberately ignored: live Bridge testing
-    # proved that field can be stale by hours or days.
+
+        # Live Bridge validation on 2026-09-13 proved that an ACTIVE Smart
+        # Scene can legitimately report the previous weekday after midnight
+        # (Sunday 03:35 local, active_timeslot weekday=Saturday).  Hue's live
+        # active_timeslot is therefore authoritative while state == active.
+        # Validate only that the reported original timeslot index exists and
+        # still points at a Scene in the current Smart Scene definition.
+        targets_by_id = {index: rid for _, index, rid in boundaries}
+        target_rid = targets_by_id.get(active_id)
+        if target_rid is None:
+            return DesiredState(status="unresolved", reason="active_timeslot_id_missing_from_schedule")
+        timeslot_id = active_id
+    else:
+        # When inactive, active_timeslot is deliberately ignored: live Bridge
+        # testing proved that field can be stale by hours or days.
+        eligible = [item for item in boundaries if item[0] <= local_now]
+        if not eligible:
+            return DesiredState(status="unresolved", reason="no_current_timeslot")
+        selected_boundary, timeslot_id, target_rid = max(eligible, key=lambda item: item[0])
+
+        # The first installed v0.3.0 live recovery test exposed a previously
+        # unverified Hue carry-forward rule: at 03:35 Sunday an ACTIVE Golden
+        # Hours scene still reported Saturday's 22:00 child, not the explicit
+        # 00:00 entry.  Because inactive active_timeslot cannot be trusted, do
+        # not guess which child should govern from midnight until the next
+        # non-midnight boundary.  Fail closed until this behavior is directly
+        # validated.
+        if selected_boundary.timetz().replace(tzinfo=None) == time(0, 0, 0):
+            return DesiredState(
+                status="unresolved",
+                reason="inactive_smart_post_midnight_semantics_unverified",
+                controller_kind="smart_scene",
+                controller_rid=controller.rid,
+                controller_name=_metadata_name(smart),
+            )
 
     child = _resource_by_id(resources, target_rid, "scene")
     if child is None or not _same_group(child, room_id):

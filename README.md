@@ -1,8 +1,8 @@
-# Hue Scene Recall v0.3.0
+# Hue Scene Recall v0.3.1
 
 Hue Scene Recall restores **saved Hue appearance intent** to an individual Hue bulb after that bulb recovers from a physical-power/connectivity failure, without changing whether the bulb is on or off.
 
-v0.3.0 is an architecture rewrite based on source review plus live Hue Bridge validation. It replaces the room-wide/whole-scene recovery path from v0.2.1.
+v0.3.1 is a targeted correction to the v0.3.0 controller-journal / exact-light architecture. The first live v0.3.0 outage test verified per-light impairment and reconnect handling but exposed an overnight Smart Scene resolver bug: at 03:35 Sunday the Hue Bridge legitimately reported the active Golden Hours timeslot as Saturday's 22:00 child. v0.3.0 rejected that valid Hue state before any recovery write.
 
 ## Core rule
 
@@ -82,9 +82,17 @@ Unsupported Scene action fields fail closed instead of being approximated.
 
 ## Smart Scenes / Golden Hours
 
-For the current validated Golden Hours shape, v0.3.0 can recover from an inactive Smart Scene by calculating the current child from fresh Bridge data.
+For the currently validated Golden Hours shape, v0.3.1 uses two deliberately different resolver paths.
 
-Supported schedule shape in this release:
+### Active Smart Scene
+
+When Hue reports the stored Smart Scene `state = active`, the Bridge's live `active_timeslot.timeslot_id` is authoritative after validating that the original timeslot index still exists and points to a Scene in the current Smart Scene definition.
+
+The reported `active_timeslot.weekday` is **not** required to equal the current calendar weekday. Live Bridge validation on 2026-09-13 showed Golden Hours 5 active at about 03:35 Sunday while Hue correctly reported `timeslot_id = 4`, `weekday = saturday`, targeting the saved **Sleepy** Scene. v0.3.0's weekday-equality check was therefore invalid and has been removed.
+
+### Inactive Smart Scene
+
+Inactive Smart Scene `active_timeslot` remains deliberately ignored because live testing proved it can be stale by hours or days. Outside the unverified overnight carry-forward window, the current child can be calculated from fresh Bridge schedule data for the supported schedule shape:
 
 - recurrence explicitly covers all seven weekdays;
 - an explicit `00:00` fixed timeslot exists;
@@ -93,9 +101,7 @@ Supported schedule shape in this release:
 - the Bridge timezone is used;
 - timeslots are evaluated by resolved wall-clock time, not array order.
 
-Inactive Smart Scene `active_timeslot` is deliberately ignored because live testing proved it can be stale.
-
-For an active Smart Scene, `active_timeslot` is accepted only when it agrees with the current schedule calculation.
+The live v0.3.0 failure also revealed that Hue's active overnight carry-forward semantics do **not** match the previously assumed simple `00:00` rollover rule. Therefore, while a stored Smart Scene is inactive, v0.3.1 fails closed from the explicit midnight boundary until the next non-midnight boundary rather than guessing which saved child should govern.
 
 ### Transition safety
 
@@ -116,11 +122,12 @@ It does not attempt to interpolate a native Hue Smart Scene transition.
 This release intentionally does not guess when it encounters:
 
 - `sunrise` timeslots;
-- sparse weekday recurrence requiring carry-forward semantics;
+- sparse weekday recurrence requiring unverified carry-forward semantics;
 - missing explicit midnight rollover;
 - unsupported/unknown timeslot kinds;
 - non-normal-day sunset data;
-- active timeslot/schedule disagreement.
+- an active Smart Scene whose reported timeslot index no longer exists in its current definition;
+- an inactive Smart Scene during the unverified post-midnight carry-forward window.
 
 Those recoveries are reported as `aborted_unresolved` and make no write.
 
@@ -134,7 +141,7 @@ Manual selection from the Hue Recall Scene select entity still performs Hue's no
 
 ## Verification and retry
 
-For a required write, v0.3.0:
+For a required write, v0.3.1:
 
 1. subscribes to updates for the exact Light RID;
 2. re-checks connectivity/availability;
@@ -153,20 +160,17 @@ The existing `hueRecallPower` label is left untouched and is not required by the
 
 ## Existing entities retained on upgrade
 
-v0.3.0 preserves the v0.2.x unique IDs for:
+v0.3.1 preserves the v0.2.x/v0.3.0 unique IDs for:
 
 - `switch.hue_recall_automatic_recovery`
 - each `<room> Hue Recall Scene` select
 - each `<room> Hue Recall Recovery Diagnostics` sensor
 
-The diagnostics sensor now reports the persisted controller identity and per-light recovery state/results.
+The diagnostics sensor reports persisted controller identity and per-light recovery state/results.
 
-## Upgrade from v0.2.1
+## Upgrade / storage compatibility
 
-The existing storage key/version is retained so the master switch value can migrate without a special config-entry migration. v0.2.1 has no saved controller journal, so v0.3.0 initializes controller identity only from positive current Bridge evidence:
-
-- a uniquely active Smart Scene; or
-- if no Smart Scene is active, a uniquely active regular Scene.
+The existing storage key/version remains unchanged. v0.3.1 needs no journal migration from v0.3.0 and continues to migrate the pre-v0.3 master switch value without caching appearance.
 
 Historical `last_recall` timestamps are seeded only as edge baselines and are never used to pick a recovery winner.
 
@@ -174,7 +178,9 @@ Historical `last_recall` timestamps are seeded only as edge baselines and are ne
 
 This archive is a **build artifact only**. Creating it does not modify the live Home Assistant installation.
 
-For the repository/HACS workflow, replace the repository source with this build, publish it, refresh HACS repository information, update Hue Scene Recall, and restart/reload Home Assistant as appropriate. Keep v0.2.1 available as rollback until v0.3.0 is verified on the live instance.
+At build time, v0.3.0 is APPLIED on the live instance, but its first controlled Basement Bathroom outage test ended `aborted_unresolved` for both bulbs because of the now-removed weekday consistency check. v0.3.1 is not APPLIED until installed/reloaded.
+
+For the repository/HACS workflow, replace/publish the repository source with this build, refresh HACS repository information, update Hue Scene Recall, and restart/reload Home Assistant as appropriate. Keep the prior package available for rollback until v0.3.1 is live-tested.
 
 ## Minimum environment
 
