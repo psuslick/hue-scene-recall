@@ -355,3 +355,239 @@ def test_recovery_function_contains_no_scene_recall_or_grouped_light_actuator():
 def test_safe_automatic_payload_allowlist_structurally_excludes_power():
     assert "on" not in desired.SAFE_APPEARANCE_FIELDS
     assert desired.SAFE_APPEARANCE_FIELDS == {"dimming", "color", "color_temperature"}
+
+
+def _scene_two_lights(rid: str, brightness_a: float, brightness_b: float, **extra):
+    scene = _scene(rid, brightness_a, light_id=LIGHT_A, **extra)
+    scene["actions"].append({
+        "target": {"rid": LIGHT_B, "rtype": "light"},
+        "action": {"on": {"on": True}, "dimming": {"brightness": brightness_b}},
+    })
+    return scene
+
+
+def test_capture_active_smart_episode_contains_identity_not_appearance():
+    smart = _smart(state="active", active_id=5)
+    episode, error = desired.capture_active_smart_episode(
+        smart,
+        room_id=ROOM,
+        now=datetime(2026, 9, 13, 4, 1, tzinfo=TZ),
+        child_activation_mode="static",
+    )
+    assert error is None
+    assert episode is not None
+    assert episode.controller_rid == SMART
+    assert episode.timeslot_id == 5
+    assert episode.child_scene_rid == SCENE_OLD
+    assert episode.child_activation_mode == "static"
+    assert not hasattr(episode, "brightness")
+    assert not hasattr(episode, "color")
+    assert not hasattr(episode, "on")
+
+
+def test_inactive_smart_uses_shared_episode_child_post_midnight():
+    resources = _base_resources(
+        _smart(state="inactive", active_id=5),
+        _scene(SCENE_OLD, 39.52, status={"active": "inactive"}),
+        _scene(SCENE_NEW, 25.29),
+    )
+    episode = desired.SmartRecoveryEpisode(
+        controller_rid=SMART,
+        timeslot_id=5,
+        child_scene_rid=SCENE_OLD,
+        captured_at=datetime(2026, 9, 13, 4, 1, tzinfo=TZ),
+        child_activation_mode="static",
+    )
+    out = resolve_desired_state(
+        resources,
+        room_id=ROOM,
+        light_id=LIGHT_A,
+        controller=ControllerRef("smart_scene", SMART),
+        now=datetime(2026, 9, 13, 4, 3, tzinfo=TZ),
+        smart_episode=episode,
+    )
+    assert out.status == "resolved"
+    assert out.reason == "smart_scene_recovery_episode_child"
+    assert out.effective_scene_rid == SCENE_OLD
+    assert out.payload == {"dimming": {"brightness": 39.52}}
+
+
+def test_two_siblings_resolve_same_episode_after_smart_parent_goes_inactive():
+    resources = _base_resources(
+        _smart(state="inactive", active_id=5),
+        _scene_two_lights(SCENE_OLD, 39.52, 39.52, status={"active": "inactive"}),
+        _scene(SCENE_NEW, 25.29),
+    )
+    episode = desired.SmartRecoveryEpisode(
+        controller_rid=SMART,
+        timeslot_id=5,
+        child_scene_rid=SCENE_OLD,
+        captured_at=datetime(2026, 9, 13, 4, 1, tzinfo=TZ),
+        child_activation_mode="static",
+    )
+    for light_id in (LIGHT_A, LIGHT_B):
+        out = resolve_desired_state(
+            resources,
+            room_id=ROOM,
+            light_id=light_id,
+            controller=ControllerRef("smart_scene", SMART),
+            now=datetime(2026, 9, 13, 4, 3, tzinfo=TZ),
+            smart_episode=episode,
+        )
+        assert out.status == "resolved"
+        assert out.effective_scene_rid == SCENE_OLD
+        assert out.payload == {"dimming": {"brightness": 39.52}}
+
+
+def test_episode_is_ignored_after_controller_identity_changes():
+    resources = _base_resources(
+        _smart(state="inactive", active_id=5),
+        _scene(SCENE_OLD, 39.52),
+        _scene(SCENE_NEW, 25.29),
+    )
+    episode = desired.SmartRecoveryEpisode(
+        controller_rid="different-smart-controller",
+        timeslot_id=5,
+        child_scene_rid=SCENE_OLD,
+        captured_at=datetime(2026, 9, 13, 4, 1, tzinfo=TZ),
+        child_activation_mode="static",
+    )
+    out = resolve_desired_state(
+        resources,
+        room_id=ROOM,
+        light_id=LIGHT_A,
+        controller=ControllerRef("smart_scene", SMART),
+        now=datetime(2026, 9, 13, 4, 3, tzinfo=TZ),
+        smart_episode=episode,
+    )
+    assert out.status == "unresolved"
+    assert out.reason == "inactive_smart_post_midnight_semantics_unverified"
+
+
+def test_episode_expiry_re_resolves_current_inactive_schedule_after_transition():
+    resources = _base_resources(
+        _smart(state="inactive", active_id=3),
+        _scene(SCENE_OLD, 44),
+        _scene(SCENE_NEW, 25),
+    )
+    episode = desired.SmartRecoveryEpisode(
+        controller_rid=SMART,
+        timeslot_id=3,
+        child_scene_rid=SCENE_OLD,
+        captured_at=datetime(2026, 9, 12, 21, 50, tzinfo=TZ),
+        child_activation_mode="static",
+    )
+    out = resolve_desired_state(
+        resources,
+        room_id=ROOM,
+        light_id=LIGHT_A,
+        controller=ControllerRef("smart_scene", SMART),
+        now=datetime(2026, 9, 12, 22, 2, tzinfo=TZ),
+        smart_episode=episode,
+    )
+    assert out.status == "resolved"
+    assert out.effective_scene_rid == SCENE_NEW
+    assert out.payload == {"dimming": {"brightness": 25}}
+    assert "smart_episode_crossed_transition_boundary" in out.reason
+
+
+def test_episode_crossing_into_unverified_post_midnight_window_fails_closed():
+    resources = _base_resources(
+        _smart(state="inactive", active_id=4),
+        _scene(SCENE_OLD, 44),
+        _scene(SCENE_NEW, 25),
+    )
+    episode = desired.SmartRecoveryEpisode(
+        controller_rid=SMART,
+        timeslot_id=4,
+        child_scene_rid=SCENE_NEW,
+        captured_at=datetime(2026, 9, 12, 23, 50, tzinfo=TZ),
+        child_activation_mode="static",
+    )
+    out = resolve_desired_state(
+        resources,
+        room_id=ROOM,
+        light_id=LIGHT_A,
+        controller=ControllerRef("smart_scene", SMART),
+        now=datetime(2026, 9, 13, 0, 2, tzinfo=TZ),
+        smart_episode=episode,
+    )
+    assert out.status == "unresolved"
+    assert out.reason == "inactive_smart_post_midnight_semantics_unverified"
+
+
+def test_palette_rich_static_scene_is_not_mistaken_for_dynamic_playback():
+    scene = _scene(
+        SCENE_OLD,
+        39.52,
+        status={"active": "static"},
+        palette={
+            "color": [
+                {"color": {"xy": {"x": 0.58, "y": 0.38}}},
+                {"color": {"xy": {"x": 0.65, "y": 0.30}}},
+            ]
+        },
+        auto_dynamic=False,
+    )
+    resources = _base_resources(scene)
+    out = resolve_desired_state(
+        resources,
+        room_id=ROOM,
+        light_id=LIGHT_A,
+        controller=ControllerRef("scene", SCENE_OLD),
+        now=datetime(2026, 9, 13, 4, 5, tzinfo=TZ),
+    )
+    assert out.status == "resolved"
+    assert out.payload == {"dimming": {"brightness": 39.52}}
+
+
+def test_actual_dynamic_palette_activation_fails_closed():
+    scene = _scene(
+        SCENE_OLD,
+        39.52,
+        status={"active": "dynamic_palette"},
+        auto_dynamic=False,
+    )
+    resources = _base_resources(scene)
+    out = resolve_desired_state(
+        resources,
+        room_id=ROOM,
+        light_id=LIGHT_A,
+        controller=ControllerRef("scene", SCENE_OLD),
+        now=datetime(2026, 9, 13, 4, 5, tzinfo=TZ),
+    )
+    assert out.status == "unresolved"
+    assert out.reason == "dynamic_scene_exact_light_recovery_unsupported"
+
+
+def test_manager_passes_room_episode_to_each_exact_light_resolve():
+    source = (ROOT / "manager.py").read_text()
+    assert "smart_episode=room.recovery_episode" in source
+    assert "self._ensure_room_recovery_episode(room)" in source
+    assert "room.recovery_episode is not None" in source
+
+
+def test_episode_cross_day_after_first_daytime_boundary_re_resolves_schedule():
+    resources = _base_resources(
+        _smart(state="inactive", active_id=4),
+        _scene(SCENE_OLD, 44),
+        _scene(SCENE_NEW, 25),
+    )
+    episode = desired.SmartRecoveryEpisode(
+        controller_rid=SMART,
+        timeslot_id=4,
+        child_scene_rid=SCENE_NEW,
+        captured_at=datetime(2026, 9, 12, 23, 50, tzinfo=TZ),
+        child_activation_mode="static",
+    )
+    out = resolve_desired_state(
+        resources,
+        room_id=ROOM,
+        light_id=LIGHT_A,
+        controller=ControllerRef("smart_scene", SMART),
+        now=datetime(2026, 9, 13, 8, 0, tzinfo=TZ),
+        smart_episode=episode,
+    )
+    assert out.status == "resolved"
+    assert out.effective_scene_rid == SCENE_OLD
+    assert "smart_episode_crossed_day_boundary" in out.reason

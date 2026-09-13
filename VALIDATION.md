@@ -1,61 +1,70 @@
-# v0.3.1 validation record
+# v0.3.2 validation record
 
 Status of this artifact: **PROPOSED build; not APPLIED to live Home Assistant.**
 
-## Live v0.3.0 failure that triggered this patch
+## Live v0.3.1 evidence that triggered this build
 
-The first controlled Basement Bathroom power-cycle test on the APPLIED v0.3.0 build verified that both exact bulbs independently armed on HA `unavailable` + Hue `connectivity_issue`, then independently triggered recovery when HA returned available and Hue returned `connected`.
+During the first controlled Basement Bathroom power cycle after v0.3.1 installation:
 
-Both transactions then stopped before any write with:
+### Basement Bath A19 01
 
-```text
-aborted_unresolved
-active_timeslot_weekday_conflicts_with_schedule
-```
+- impairment detected by HA unavailable + Hue connectivity issue;
+- reconnect detected;
+- controller: Golden Hours 5;
+- effective Scene: Sleepy;
+- exact-light recovery result: **verified**.
 
-Live state at the time showed:
+### Basement Bath A19 02
 
-- local time: about 03:35 Sunday, America/New_York;
-- controller: Golden Hours 5 (`smart_scene` RID `1ab1a166-9067-4182-80fd-f695da1c6665`);
-- Smart Scene state: active;
-- Bridge active timeslot: id `4`, weekday `saturday`;
-- active child exposed by HA Hue: **Sleepy**;
-- both bulbs had returned from power-up around 50% rather than the saved Sleepy appearance (~25.29% with per-bulb saved color).
+- same physical outage, independent reconnect about one second later;
+- Smart parent had become inactive before this sibling resolved;
+- transaction ended `aborted_unresolved` with `inactive_smart_post_midnight_semantics_unverified`.
 
-This proves v0.3.0's current-calendar-weekday equality check was invalid. The impairment/reconnect machinery was reached and worked; the desired-state resolver aborted before the actuator.
+Conclusion: v0.3.1's exact-light actuator/verification path works, but independent fresh controller resolution could diverge between sibling bulbs in one outage when Hue activity status changed between their recovery transactions.
 
-## v0.3.1 resolver rule
+## Live dynamic-capability clarification
 
-- If the stored Smart Scene is **active**, use Hue's live `active_timeslot.timeslot_id` as authoritative after confirming that original timeslot index still exists and targets a Scene in the current Smart Scene definition. Do not require `weekday` to match today's calendar weekday and do not require the active id to match a locally calculated child.
-- If the stored Smart Scene is **inactive**, continue ignoring `active_timeslot` because it can be stale. The schedule resolver remains supported outside the newly identified unverified post-midnight carry-forward interval.
-- For inactive Smart Scenes after the explicit 00:00 boundary and before the next non-midnight boundary, fail closed with `inactive_smart_post_midnight_semantics_unverified`.
+After Golden Hours 5 was explicitly reselected, HA exposed the active child as Nighttime and its Scene entity as dynamic-capable. Raw Hue Bridge state showed the actual Basement Bathroom Nighttime resource was:
 
-## Prior live findings still encoded
+- `auto_dynamic = false`;
+- `status.active = static`;
+- exact saved actions around 39.52% with per-bulb XY values matching the live bulbs.
 
-- Inactive Smart Scene `active_timeslot` can be stale and is not used.
-- Active Smart Scene and active regular child can coexist; child `last_recall` cannot replace an active Smart parent.
-- Plain Smart Scene inactivity can result from ordinary room OFF and is not controller-replacement evidence.
-- Unsaved Hue **Set once** can replace a Smart Scene without creating a replacement Scene RID; the safe controller result is `no_recoverable_controller`.
-- A saved Scene recall produces a durable Scene RID / fresh `last_recall` edge and can become the journal controller.
-- Golden Hours with `transition_duration=60000` recalled its 22:00 child at ~21:59:00 (`B-D`).
-- Individual bulbs on the same switched circuit report `connectivity_issue` and `connected` independently.
-- Hue does not guarantee a fresh Light appearance SSE update immediately after `connected`; a fresh resource read is required.
+Therefore multi-color palette capability is not treated as evidence of current dynamic playback.
+
+## v0.3.2 correction
+
+The first impairment in a room captures a runtime-only `SmartRecoveryEpisode` containing:
+
+- Smart controller RID;
+- active timeslot id;
+- child Scene RID;
+- captured child activation mode when known;
+- timestamp.
+
+The object contains no brightness/color/color-temperature/power and is not serialized.
+
+A sibling recovery may use that child identity after the Smart parent has passively become inactive, but the saved child Scene and exact-light action are still fetched fresh at execution time.
+
+Episode use fails or falls back safely if the controller/timeslot mapping changed, a transition boundary was crossed, capture happened in a transition, or a date boundary invalidated the episode.
 
 ## Build checks
 
-- Resolver/comparison/static-invariant tests: **16 pass**.
-- Includes exact overnight active-Smart regression test.
-- Includes inactive post-midnight fail-closed regression test.
-- Includes invalid active timeslot index fail-closed test.
-- Automatic payload allowlist remains `dimming`, `color`, `color_temperature`; `on` excluded.
-- Static automatic-recovery inspection continues to prohibit Scene recall and grouped-light actuation.
+- dependency-light resolver/comparison/static-invariant tests: **26 passed**;
+- full Python `compileall`: PASS;
+- manifest/component version: `0.3.2`;
+- automatic recovery function contains no Scene recall, Smart Scene recall, or grouped-light actuator;
+- automatic exact-light writer still targets `/clip/v2/resource/light/{rid}`;
+- automatic payload allowlist remains exactly `dimming`, `color`, `color_temperature`;
+- persistent Store serialization contains controller identity only; recovery episode/context is absent;
+- tests cover the exact sibling-race pattern, post-midnight shared episode, transition expiry/fallback, date-boundary handling, palette-rich static Scene support, and actual dynamic-palette fail-closed behavior.
 
-## Not yet verified
+## Live verification still required after installation
 
-v0.3.1 still requires a new controlled live outage after installation to verify the complete path:
+Repeat a controlled Basement Bathroom outage while Golden Hours 5 is active and inspect the diagnostics. Success criteria:
 
-```text
-impairment → reconnect → active Smart child resolution → exact-light appearance PUT → verification
-```
-
-Until that succeeds, end-to-end automatic recovery remains **not VERIFIED**.
+- one room `recovery_episode` is shared during the outage;
+- both bulbs independently arm/reconnect;
+- both resolve the same effective saved child Scene unless a real schedule transition invalidates the episode;
+- both end `verified` or `already_correct` as appropriate;
+- no automatic `on`, Scene recall, Smart Scene recall, grouped-light write, or sibling power change occurs.

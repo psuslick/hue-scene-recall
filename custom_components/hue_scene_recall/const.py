@@ -4,7 +4,7 @@ from homeassistant.const import Platform
 
 DOMAIN = "hue_scene_recall"
 NAME = "Hue Scene Recall"
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 CONF_HUE_ENTRY_ID = "hue_entry_id"
 HUE_DOMAIN = "hue"

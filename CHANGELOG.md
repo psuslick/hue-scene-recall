@@ -1,49 +1,46 @@
 # Changelog
 
-## 0.3.1 — active Smart Scene overnight resolver correction
+## 0.3.2 — shared Smart Scene outage episode / sibling-race fix
 
 ### Fixed
 
-- Removed the invalid requirement that an active Smart Scene's `active_timeslot.weekday` equal the current calendar weekday.
-- Removed the active-timeslot-versus-locally-calculated-child equality check. When the Smart Scene is active, Hue's live `active_timeslot.timeslot_id` is authoritative after index/target validation.
-- Added the live regression case observed on 2026-09-13: Sunday ~03:35 with Golden Hours 5 active, `active_timeslot_id=4`, `weekday=saturday` resolves the id-4 **Sleepy** child instead of aborting.
-- Added a fail-closed guard for inactive Smart Scene recovery after midnight until the next non-midnight boundary because Hue's overnight carry-forward semantics are not yet verified for inactive reconstruction.
+- Added a volatile per-room Smart Scene recovery episode so bulbs recovering from the same physical outage use one consistent pre-outage controller/timeslot/child identity.
+- Fixed the live v0.3.1 race where Basement Bath A19 01 verified against Golden Hours 5 → Sleepy, then A19 02 re-resolved after Hue passively marked the Smart parent inactive and aborted.
+- Suppressed Scene-child `last_recall` and appearance-change controller classification while a recovery episode is active, preventing recovery-generated events from replacing the Smart controller mid-episode.
+- Delayed normal controller reconciliation until all affected bulbs in the room are no longer impaired/armed.
+- Added episode invalidation on positive controller replacement/clear.
+
+### Schedule safety
+
+- Episode identity is valid only while its Smart controller/timeslot/child mapping remains current and no transition start (`B-D`) has been crossed.
+- Episodes never cross a Bridge-local calendar-day boundary as authority.
+- When an episode expires, v0.3.2 re-resolves current inactive Smart schedule state where supported rather than blindly reusing the captured child.
+- The existing fail-closed post-midnight inactive-Smart guard remains when current Hue semantics cannot be reconstructed safely.
+
+### Dynamic Scene handling
+
+- Clarified that HA's palette-derived `is_dynamic` indication is not runtime dynamic-playback evidence.
+- Static Scene activation remains recoverable even when a Scene has a multi-color palette.
+- Actual `dynamic_palette` activation fails closed because an exact Light PUT cannot rejoin Hue dynamic Scene playback without a whole-Scene recall.
+- `auto_dynamic=true` remains fail-closed unless positive static activation evidence exists.
 
 ### Preserved safety invariants
 
 - Automatic recovery never writes `on`.
 - Automatic recovery never recalls a Scene or Smart Scene.
 - Automatic recovery never writes a grouped light.
-- Recovery targets only the exact recovered Light RID.
-- Every recovery/retry resolves from fresh Bridge data.
-- Unsupported or ambiguous desired-state cases make no write.
+- Each actuator write still targets only the exact recovered Light RID.
+- Recovery episodes persist no appearance values and are never written to storage.
+- Saved Scene definitions are re-pulled from the Bridge at every recovery/retry.
+
+## 0.3.1 — active Smart Scene overnight resolver correction
+
+- Trusted Hue's live active Smart `active_timeslot.timeslot_id` without requiring weekday equality.
+- Added fail-closed inactive post-midnight handling.
 
 ## 0.3.0 — controller-journal / exact-light recovery rewrite
 
-### Changed
-
-- Replaced room-wide recovery with per-Light-RID recovery.
-- Replaced whole Scene recall during automatic recovery with exact-light appearance-only PUTs.
-- Added durable per-room controller identity (`scene` or `smart_scene` RID) while continuing to prohibit local appearance/power caching.
-- Removed historical newest-`last_recall` recovery selection.
-- Added saved-Scene versus unsaved-appearance controller reconciliation.
-- Added supported inactive Smart Scene schedule resolution for the then-validated all-days fixed-time + sunset Golden Hours shape.
-- Added transition deferral using live-validated `boundary - transition_duration` semantics.
-- Added exact-light SSE verification with exact GET fallback.
-- Added one bounded, fully re-resolved retry.
-- Expanded diagnostics to expose controller identity and per-light transaction state.
-
-### Safety invariants
-
-- Automatic recovery never writes `on`.
-- Automatic recovery never recalls a Scene or Smart Scene.
-- Automatic recovery never writes a grouped light.
-- A sibling bulb is never touched merely because another bulb recovered.
-- Unsupported desired-state cases fail closed.
-- Every retry and deferred continuation re-pulls current Bridge state.
-
-### Compatibility
-
-- Existing Hue Scene Recall config entry remains version 1.
-- Existing master switch, room select, and diagnostics entity unique IDs are retained.
-- Existing `master_enabled` storage value is retained.
+- Replaced room-wide whole-Scene recovery with per-Light-RID appearance-only recovery.
+- Persisted controller identity only.
+- Removed historical newest-`last_recall` authority.
+- Added Smart Scene schedule/transition handling and exact-light verification.

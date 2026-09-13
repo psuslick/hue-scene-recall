@@ -38,7 +38,12 @@ from .const import (
     VERIFY_EVENT_TIMEOUT_SECONDS,
 )
 from .controller_tracker import ControllerRef, make_controller
-from .desired_state import DesiredState, resolve_desired_state
+from .desired_state import (
+    DesiredState,
+    SmartRecoveryEpisode,
+    capture_active_smart_episode,
+    resolve_desired_state,
+)
 from .recovery_logic import (
     RecoveryReason,
     impairment_reasons,
@@ -129,6 +134,8 @@ class RoomRecallState:
     )
     fresh_regular_candidates: set[str] = field(default_factory=set)
     material_change_pending: bool = False
+    last_active_smart_context: SmartRecoveryEpisode | None = None
+    recovery_episode: SmartRecoveryEpisode | None = None
     last_controller_change_at: datetime | None = None
     last_controller_change_reason: str | None = None
 
@@ -445,6 +452,7 @@ class HueSceneRecallManager:
                     room,
                     make_controller("smart_scene", active_smart[0].id, reason="startup_active_smart_scene"),
                 )
+                self._remember_active_smart_context(room, active_smart[0])
                 continue
             if active_smart:
                 continue
@@ -517,17 +525,105 @@ class HueSceneRecallManager:
             and room.controller.rid == controller.rid
         ):
             return
+
+        previous = room.controller
         room.controller = controller
         if controller is None:
             self._stored_controllers.pop(room.room_id, None)
         else:
             self._stored_controllers[room.room_id] = controller
+
+        # A recovery episode belongs only to one specific Smart controller.
+        # Positive replacement/clearing invalidates both the active episode and
+        # the last confirmed Smart context. Passive inactivation does not call
+        # _set_controller, so it deliberately preserves them.
+        same_smart_identity = (
+            previous is not None
+            and previous.kind == "smart_scene"
+            and controller is not None
+            and controller.kind == "smart_scene"
+            and previous.rid == controller.rid
+        )
+        if not same_smart_identity:
+            room.recovery_episode = None
+            room.last_active_smart_context = None
+
         room.last_controller_change_at = _now()
         room.last_controller_change_reason = reason or (
             controller.reason if controller is not None else "cleared"
         )
         self._schedule_save()
         self._notify()
+
+    def _remember_active_smart_context(
+        self, room: RoomRecallState, scene: HueSmartScene
+    ) -> None:
+        """Remember the last positively observed active Smart child identity."""
+        try:
+            raw = dataclass_to_dict(scene, skip_none=True)
+        except (TypeError, ValueError):
+            return
+        active = raw.get("active_timeslot")
+        active_id = active.get("timeslot_id") if isinstance(active, dict) else None
+        child_mode: str | None = None
+        try:
+            active_id_int = int(active_id)
+            week = raw.get("week_timeslots")
+            day = week[0] if isinstance(week, list) and len(week) == 1 else None
+            slots = day.get("timeslots") if isinstance(day, dict) else None
+            slot = slots[active_id_int] if isinstance(slots, list) else None
+            target = slot.get("target") if isinstance(slot, dict) else None
+            target_rid = target.get("rid") if isinstance(target, dict) else None
+            child = self._get_scene(target_rid) if isinstance(target_rid, str) else None
+            if child is not None and not isinstance(child, HueSmartScene):
+                child_mode = _scene_active_value(child)
+        except (IndexError, TypeError, ValueError):
+            child_mode = None
+
+        episode, _ = capture_active_smart_episode(
+            raw,
+            room_id=room.room_id,
+            now=_now(),
+            child_activation_mode=child_mode,
+        )
+        if episode is not None:
+            room.last_active_smart_context = episode
+
+    def _ensure_room_recovery_episode(self, room: RoomRecallState) -> None:
+        """Freeze one controller/child identity for all bulbs in this outage."""
+        if room.recovery_episode is not None:
+            return
+        controller = room.controller
+        if controller is None or controller.kind != "smart_scene":
+            return
+        # Do not freeze a Smart baseline while healthy controller replacement is
+        # already being reconciled. Failing closed is safer than resurrecting a
+        # controller after a just-issued Set once / saved-Scene change.
+        if room.material_change_pending or room.fresh_regular_candidates:
+            return
+
+        current = self._get_scene(controller.rid)
+        if isinstance(current, HueSmartScene) and current.state == SmartSceneState.ACTIVE:
+            self._remember_active_smart_context(room, current)
+
+        context = room.last_active_smart_context
+        if context is not None and context.controller_rid == controller.rid:
+            room.recovery_episode = context
+
+    def _maybe_clear_room_recovery_episode(self, room: RoomRecallState) -> None:
+        if room.recovery_episode is None:
+            return
+        for light_id in room.hue_light_ids:
+            light = self.lights.get(light_id)
+            if light is None:
+                continue
+            if light.armed or self._current_reasons(light):
+                return
+        room.recovery_episode = None
+        room.fresh_regular_candidates.clear()
+        room.material_change_pending = False
+        # Reconcile only after the whole outage episode is complete.
+        self._schedule_controller_reconcile(room.room_id)
 
     @callback
     def _schedule_controller_reconcile(self, room_id: str) -> None:
@@ -555,11 +651,21 @@ class HueSceneRecallManager:
                 room,
                 make_controller("smart_scene", active_smart[0].id, reason="active_smart_scene"),
             )
+            self._remember_active_smart_context(room, active_smart[0])
             room.fresh_regular_candidates.clear()
             room.material_change_pending = False
             return
         if len(active_smart) > 1:
             room.last_controller_change_reason = "ambiguous_multiple_active_smart_scenes"
+            room.fresh_regular_candidates.clear()
+            room.material_change_pending = False
+            self._notify()
+            return
+
+        if room.recovery_episode is not None:
+            # Scene/Light events produced by a physical outage or by our first
+            # exact-light repair are not controller replacement evidence for a
+            # sibling still recovering from the same episode.
             room.fresh_regular_candidates.clear()
             room.material_change_pending = False
             self._notify()
@@ -683,6 +789,9 @@ class HueSceneRecallManager:
     def _process_light_condition(self, light: LightRecoveryState) -> None:
         reasons = self._current_reasons(light)
         if reasons:
+            room = self.rooms.get(light.room_id)
+            if room is not None:
+                self._ensure_room_recovery_episode(room)
             light.trigger_reasons.update(reasons)
             if not light.armed:
                 light.armed = True
@@ -768,6 +877,7 @@ class HueSceneRecallManager:
                 light_id=light.hue_light_id,
                 controller=room.controller,
                 now=_now(),
+                smart_episode=room.recovery_episode,
             )
             self._record_desired(light, desired)
 
@@ -972,6 +1082,9 @@ class HueSceneRecallManager:
         light.armed = False
         light.trigger_reasons.clear()
         light.status = "healthy" if not self._current_reasons(light) else "impaired"
+        room = self.rooms.get(light.room_id)
+        if room is not None:
+            self._maybe_clear_room_recovery_episode(room)
         self._notify()
 
     def _current_reasons(self, light: LightRecoveryState) -> frozenset[RecoveryReason]:
@@ -1049,7 +1162,7 @@ class HueSceneRecallManager:
             return
         room_id = self._light_to_room[light_id]
         room = self.rooms.get(room_id)
-        if room is None or not self._room_healthy(room):
+        if room is None or room.recovery_episode is not None or not self._room_healthy(room):
             return
         room.material_change_pending = True
         self._schedule_controller_reconcile(room_id)
@@ -1080,6 +1193,7 @@ class HueSceneRecallManager:
                     room,
                     make_controller("smart_scene", scene.id, reason="smart_scene_became_active"),
                 )
+                self._remember_active_smart_context(room, scene)
                 room.fresh_regular_candidates.clear()
                 room.material_change_pending = False
             else:
@@ -1090,6 +1204,38 @@ class HueSceneRecallManager:
         new_last = _scene_last_recall(scene)
         old_last = self._regular_last_recall.get(scene_id)
         self._regular_last_recall[scene_id] = new_last
+
+        # SmartScene and child Scene updates can arrive in separate SSE
+        # envelopes. If this is the child of the currently active Smart parent,
+        # refresh the volatile context with the child's actual Bridge activation
+        # mode (static vs dynamic_palette). This avoids treating HA's
+        # palette-capability `is_dynamic` flag as runtime activation evidence.
+        context = room.last_active_smart_context
+        if (
+            context is not None
+            and context.child_scene_rid == scene_id
+            and room.controller is not None
+            and room.controller.kind == "smart_scene"
+            and room.controller.rid == context.controller_rid
+            and any(
+                active.id == context.controller_rid
+                for active in self._active_smart_scenes(room_id)
+            )
+            and _scene_active_value(scene) != "inactive"
+        ):
+            room.last_active_smart_context = SmartRecoveryEpisode(
+                controller_rid=context.controller_rid,
+                timeslot_id=context.timeslot_id,
+                child_scene_rid=context.child_scene_rid,
+                captured_at=_now(),
+                child_activation_mode=_scene_active_value(scene),
+            )
+
+        if room.recovery_episode is not None:
+            # A Smart Scene's child can emit a fresh last_recall during the
+            # same physical outage/recovery. Do not promote that child over the
+            # shared pre-outage Smart controller.
+            return
         if new_last is not None and new_last != old_last:
             room.fresh_regular_candidates.add(scene_id)
         self._schedule_controller_reconcile(room_id)
@@ -1233,6 +1379,17 @@ class HueSceneRecallManager:
             "controller_reason": controller.reason if controller else None,
             "last_controller_change_at": _iso(room.last_controller_change_at),
             "last_controller_change_reason": room.last_controller_change_reason,
+            "recovery_episode": (
+                {
+                    "controller_rid": room.recovery_episode.controller_rid,
+                    "timeslot_id": room.recovery_episode.timeslot_id,
+                    "child_scene_rid": room.recovery_episode.child_scene_rid,
+                    "child_activation_mode": room.recovery_episode.child_activation_mode,
+                    "captured_at": _iso(room.recovery_episode.captured_at),
+                }
+                if room.recovery_episode is not None
+                else None
+            ),
             "lights": lights,
         }
 
