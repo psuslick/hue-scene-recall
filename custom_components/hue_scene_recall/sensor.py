@@ -16,21 +16,17 @@ from .manager import HueSceneRecallManager
 async def async_setup_entry(
     hass, entry: HueSceneRecallConfigEntry, async_add_entities: AddConfigEntryEntitiesCallback
 ) -> None:
-    """Set up one Recorder-friendly recovery diagnostics sensor per Hue room."""
     manager = entry.runtime_data
     added_room_ids: set[str] = set()
 
     @callback
     def _add_missing_room_entities() -> None:
-        new_room_ids = [
-            room_id for room_id in manager.room_ids() if room_id not in added_room_ids
-        ]
+        new_room_ids = [room_id for room_id in manager.room_ids() if room_id not in added_room_ids]
         if not new_room_ids:
             return
         added_room_ids.update(new_room_ids)
         async_add_entities(
-            HueRecallRecoveryDiagnosticsSensor(manager, room_id)
-            for room_id in new_room_ids
+            HueRecallRecoveryDiagnosticsSensor(manager, room_id) for room_id in new_room_ids
         )
 
     _add_missing_room_entities()
@@ -38,7 +34,7 @@ async def async_setup_entry(
 
 
 class HueRecallRecoveryDiagnosticsSensor(SensorEntity):
-    """Expose recovery-condition state and exact event timestamps."""
+    """Expose controller identity and exact-light recovery evidence."""
 
     _attr_should_poll = False
     _attr_icon = "mdi:access-point-check"
@@ -47,12 +43,10 @@ class HueRecallRecoveryDiagnosticsSensor(SensorEntity):
     def __init__(self, manager: HueSceneRecallManager, room_id: str) -> None:
         self.manager = manager
         self.room_id = room_id
-        self._attr_unique_id = (
-            f"{manager.hue_entry.entry_id}:{room_id}:recovery_diagnostics"
-        )
+        # Preserve v0.2.1 entity identity.
+        self._attr_unique_id = f"{manager.hue_entry.entry_id}:{room_id}:recovery_diagnostics"
 
     async def async_added_to_hass(self) -> None:
-        """Subscribe to manager changes so Recorder receives every audit edge."""
         self.async_on_remove(self.manager.subscribe(self._handle_manager_update))
 
     @callback
@@ -72,12 +66,8 @@ class HueRecallRecoveryDiagnosticsSensor(SensorEntity):
 
     @property
     def native_value(self) -> str | None:
-        if not self.available:
-            return None
-        return self.manager.room_diagnostic_state(self.room_id)
+        return self.manager.room_diagnostic_state(self.room_id) if self.available else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        if not self.available:
-            return {}
-        return self.manager.room_diagnostic_attributes(self.room_id)
+        return self.manager.room_diagnostic_attributes(self.room_id) if self.available else {}

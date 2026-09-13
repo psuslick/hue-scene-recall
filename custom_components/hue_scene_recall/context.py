@@ -1,4 +1,4 @@
-"""Small, dependency-free helpers for Home Assistant event classification."""
+"""Compatibility helper retained from earlier Hue Scene Recall releases."""
 
 from __future__ import annotations
 

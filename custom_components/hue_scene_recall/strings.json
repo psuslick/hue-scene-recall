@@ -5,9 +5,7 @@
       "user": {
         "title": "Choose a Hue bridge",
         "description": "Hue Scene Recall reuses Home Assistant's existing local Hue V2 connection.",
-        "data": {
-          "hue_entry_id": "Hue bridge"
-        }
+        "data": {"hue_entry_id": "Hue bridge"}
       }
     },
     "abort": {

@@ -31,6 +31,9 @@ async def async_setup_entry(
     if getattr(bridge, "api_version", 1) != 2:
         raise ConfigEntryNotReady("Hue Scene Recall requires a Hue V2 bridge")
 
+    # The Hue runtime adapter is deliberately isolated here: v0.3 reuses the
+    # already-authenticated aiohue client/cache/SSE stream from HA rather than
+    # creating a second Hue connection.
     manager = HueSceneRecallManager(hass, entry, hue_entry, bridge)
     await manager.async_setup()
     entry.runtime_data = manager

@@ -1,16 +1,12 @@
 {
   "domain": "hue_scene_recall",
   "name": "Hue Scene Recall",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "config_flow": true,
-  "dependencies": [
-    "hue"
-  ],
+  "dependencies": ["hue"],
   "documentation": "https://github.com/psuslick/hue-scene-recall",
   "integration_type": "service",
   "issue_tracker": "https://github.com/psuslick/hue-scene-recall/issues",
   "iot_class": "local_push",
-  "codeowners": [
-    "@psuslick"
-  ]
+  "codeowners": ["@psuslick"]
 }

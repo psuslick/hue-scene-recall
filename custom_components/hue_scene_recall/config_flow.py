@@ -21,7 +21,6 @@ class HueSceneRecallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Select the Home Assistant Hue bridge to augment."""
         configured = {
             entry.data.get(CONF_HUE_ENTRY_ID) for entry in self._async_current_entries()
         }
@@ -40,7 +39,6 @@ class HueSceneRecallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             hue_entry = self.hass.config_entries.async_get_entry(hue_entry_id)
             if hue_entry is None or hue_entry.domain != HUE_DOMAIN:
                 return self.async_abort(reason="hue_bridge_missing")
-
             await self.async_set_unique_id(f"hue:{hue_entry_id}")
             self._abort_if_unique_id_configured()
             return self.async_create_entry(

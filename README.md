@@ -1,156 +1,185 @@
-# Hue Scene Recall v0.2.1
+# Hue Scene Recall v0.3.0
 
-Hue Scene Recall restores the **Hue Bridge's scene intent** after a labeled Hue room recovers from either of the two failure signals requested for recovery:
+Hue Scene Recall restores **saved Hue appearance intent** to an individual Hue bulb after that bulb recovers from a physical-power/connectivity failure, without changing whether the bulb is on or off.
 
-1. Home Assistant reports one of the room's Hue lights as `unavailable`/`unknown`.
-2. The Hue Bridge reports that light's `zigbee_connectivity.status` as `connectivity_issue`.
+v0.3.0 is an architecture rewrite based on source review plus live Hue Bridge validation. It replaces the room-wide/whole-scene recovery path from v0.2.1.
 
-These are independent recovery signals. Neither changes the scene source of truth: **Hue Bridge remains the only scene authority.**
-
-## v0.2.1 recovery path
+## Core rule
 
 ```text
-HA light unavailable/unknown ──────┐
-                                  ├─> arm room recovery
-Hue connectivity_issue ───────────┘
-
-wait until every armed condition has cleared
+exact Hue light becomes impaired
         ↓
-2.5 second settle
+that exact light becomes connected/available again
         ↓
-one fresh Hue Bridge GET: /clip/v2/resource
+short settle
         ↓
-active Smart Scene? → recall the parent Smart Scene
-otherwise → recall the room's regular scene with newest Hue status.last_recall
+pull current controller + schedule + saved Scene actions from Hue Bridge
         ↓
-exit
+resolve the exact saved action for this Light RID
+        ↓
+strip power (`on`) structurally
+        ↓
+pre-compare current Bridge light state
+        ↓
+PUT appearance only to /clip/v2/resource/light/{rid}
+        ↓
+verify by exact-light SSE, then exact GET fallback
 ```
 
-A `connectivity_issue` does **not** send a recall while the light is impaired. It arms recovery. The recall is sent when Hue reports the issue cleared and the HA light is also available. Likewise, `unavailable` arms recovery and the recall waits for HA availability to return.
+Hue Scene Recall never uses a whole Scene recall as its automatic-recovery actuator and never writes a grouped light during recovery.
 
-If both signals occur during the same physical outage, v0.2.1 produces **one recovery**, after both have cleared. It does not recall twice.
+## What is persisted
 
-## Why add Hue connectivity as a trigger?
+Only:
 
-Recorder history for Isaac's ceiling lights showed that HA typically does not mark the bulbs `unavailable` until roughly 1–2.5 minutes after their upstream physical switch removes power. Hue's `zigbee_connectivity` event stream can potentially expose the loss sooner.
+- the master automatic-recovery switch; and
+- per Hue room, a Hue controller identity (`scene` RID or `smart_scene` RID).
 
-v0.2.1 therefore listens directly to aiohue's `zigbee_connectivity` resource updates rather than polling. `connectivity_issue` is the only Hue connectivity status that arms recovery in this build, matching the requested behavior. Other Hue statuses remain visible in diagnostics but do not independently trigger recall.
+It does **not** persist brightness, color, color temperature, power state, Smart Scene child identity, Scene actions, or schedule values.
 
-## Recovery diagnostics / auditing
+This means edits to an existing saved Hue Scene automatically affect the next recovery because the current Scene definition is pulled from the Bridge at recovery time.
 
-v0.2.1 adds one enabled diagnostic sensor per Hue room:
+## Controller identity
 
-`<room> Hue Recall Recovery Diagnostics`
+Hue Scene Recall recognizes three recovery-controller states:
 
-Its state is one of:
+- `smart_scene` + RID
+- `scene` + RID
+- `no_recoverable_controller`
 
-- `healthy`
-- `connectivity_issue`
-- `unavailable`
-- `connectivity_issue+unavailable`
-- `recovering`
+A currently active Smart Scene is positive controller evidence.
 
-The entity is a normal Home Assistant diagnostic sensor, so Recorder can retain its state/attribute transitions. Its per-light attributes include:
+A freshly recalled saved regular Scene can replace a Smart Scene controller when Hue reports the regular Scene active and advances its `last_recall`. `last_recall` is used only as an **edge detector**. Historical "newest last_recall wins" logic has been removed.
 
-- current HA availability;
-- current Hue Zigbee connectivity status;
-- Hue connectivity resource ID;
-- `last_connectivity_issue_at`;
-- `last_connectivity_recovered_at`;
-- `last_ha_unavailable_at`;
-- `last_ha_available_at`;
-- counts of connectivity issues and HA-unavailable edges since the integration loaded.
+A healthy unsaved appearance change (for example Hue **Set once**) with no identifiable saved replacement clears the recovery controller. The transient appearance is not cached locally.
 
-Room-level attributes also expose:
+Ordinary soft OFF/ON does not clear the controller because power is excluded from appearance-change classification.
 
-- current pending recovery reasons;
-- last impairment timestamp/reason;
-- last recovery trigger (`connectivity_issue`, `unavailable`, or both);
-- last recovery-trigger timestamp;
-- last recovery result and scene.
+## Per-light impairment and recovery
 
-These diagnostics are **observational only**. They never determine which scene is recalled. The integration does not persist these timestamps into its own state store; Recorder is the audit trail.
+Each Hue Light RID has its own recovery transaction. One bulb does not wait for siblings in the same room.
 
-## Scene architecture remains unchanged from v0.2.0
+Either condition arms that exact light:
 
-Hue remains authoritative for:
+- Home Assistant light state becomes `unavailable` or `unknown`;
+- Hue `zigbee_connectivity.status` becomes `connectivity_issue`.
 
-- regular scene definitions;
-- regular scene `status.last_recall` metadata;
-- Smart Scene identity and active state;
-- Smart Scene schedules and current timeslot;
-- whether a regular scene is configured `auto_dynamic`.
+A Hue `connectivity_issue` remains armed until Hue explicitly reports `connected`.
 
-Hue Scene Recall does not cache brightness, color, soft ON/OFF state, or a local recovery scene.
+If both conditions occur, recovery begins only after both have cleared for that exact light.
 
-The following remain normal Hue operation and do not arm recovery:
+## Power-neutral writes
 
-- soft `on → off`;
-- soft `off → on`;
-- brightness changes;
-- color changes;
-- ordinary scene changes;
-- Hue timers;
-- Smart Scene timeslot changes.
+Automatic recovery has a strict allowlist:
+
+- `dimming`
+- `color`
+- `color_temperature`
+
+`on` is not an allowed output field and is asserted absent before every recovery write.
+
+Unsupported Scene action fields fail closed instead of being approximated.
 
 ## Smart Scenes / Golden Hours
 
-If Hue reports an active Smart Scene when the room recovers, the integration recalls the **parent Smart Scene**. Hue then chooses the correct current timeslot. It does not recall a cached child scene.
+For the current validated Golden Hours shape, v0.3.0 can recover from an inactive Smart Scene by calculating the current child from fresh Bridge data.
 
-## Regular scenes
+Supported schedule shape in this release:
 
-If no Smart Scene is active, the integration chooses the regular scene in that Hue room with the newest bridge-maintained `status.last_recall` timestamp and recalls Hue's current saved definition.
+- recurrence explicitly covers all seven weekdays;
+- an explicit `00:00` fixed timeslot exists;
+- fixed `time` timeslots are supported;
+- `sunset` is supported when the Bridge reports `sun_today.day_type = normal_day` and a valid `sunset_time`;
+- the Bridge timezone is used;
+- timeslots are evaluated by resolved wall-clock time, not array order.
+
+Inactive Smart Scene `active_timeslot` is deliberately ignored because live testing proved it can be stale.
+
+For an active Smart Scene, `active_timeslot` is accepted only when it agrees with the current schedule calculation.
+
+### Transition safety
+
+Live testing showed Hue recalls the next child at approximately:
+
+```text
+boundary - transition_duration
+```
+
+For a 60-second Golden Hours transition at 22:00, the child Scene recall occurred at about 21:59:00.
+
+Hue Scene Recall therefore defers recovery from `boundary - transition_duration` through a conservative 60-second post-boundary settling window. After the window it resolves everything again from fresh Bridge data.
+
+It does not attempt to interpolate a native Hue Smart Scene transition.
+
+### Fail-closed Smart Scene cases
+
+This release intentionally does not guess when it encounters:
+
+- `sunrise` timeslots;
+- sparse weekday recurrence requiring carry-forward semantics;
+- missing explicit midnight rollover;
+- unsupported/unknown timeslot kinds;
+- non-normal-day sunset data;
+- active timeslot/schedule disagreement.
+
+Those recoveries are reported as `aborted_unresolved` and make no write.
+
+## Regular Scenes
+
+The stored Scene RID is fetched fresh at recovery time. The exact Scene action targeting the recovered Light RID is projected into an appearance-only payload.
+
+Regular Scenes with `auto_dynamic = true` currently fail closed for automatic exact-light recovery because recalling the whole dynamic Scene would violate the per-light/no-sibling-write invariant.
+
+Manual selection from the Hue Recall Scene select entity still performs Hue's normal Scene or Smart Scene recall because that is an explicit user action, not automatic fault recovery.
+
+## Verification and retry
+
+For a required write, v0.3.0:
+
+1. subscribes to updates for the exact Light RID;
+2. re-checks connectivity/availability;
+3. issues an appearance-only PUT to that exact Light RID;
+4. accepts a matching exact-light SSE update as verification;
+5. falls back to a fresh exact-light GET if no matching event arrives;
+6. performs at most one fully re-resolved retry if still connected and unverified.
+
+A PUT response by itself is never considered `verified`.
 
 ## Enrollment
 
-The existing `hueRecall` entity label remains the enrollment mechanism. Automatic recovery is enabled for a Hue room only when every Hue light in that Hue room resolves to a Home Assistant Hue light entity and carries `hueRecall`.
+The existing `hueRecall` entity label remains the enrollment mechanism. A Hue room is automatically recoverable only when all Hue lights in that Hue room resolve to Home Assistant Hue light entities and all carry `hueRecall`.
 
-The legacy `hueRecallPower` label remains untouched but is not used by this integration.
+The existing `hueRecallPower` label is left untouched and is not required by the integration.
 
-## Entities
+## Existing entities retained on upgrade
 
-### `switch.hue_recall_automatic_recovery`
+v0.3.0 preserves the v0.2.x unique IDs for:
 
-Master automatic-recovery switch.
+- `switch.hue_recall_automatic_recovery`
+- each `<room> Hue Recall Scene` select
+- each `<room> Hue Recall Recovery Diagnostics` sensor
 
-### `<room> Hue Recall Scene`
+The diagnostics sensor now reports the persisted controller identity and per-light recovery state/results.
 
-Manual Hue scene selector. The selected scene remains derived from Hue bridge metadata, not locally persisted recovery memory.
+## Upgrade from v0.2.1
 
-### `<room> Hue Recall Recovery Diagnostics`
+The existing storage key/version is retained so the master switch value can migrate without a special config-entry migration. v0.2.1 has no saved controller journal, so v0.3.0 initializes controller identity only from positive current Bridge evidence:
 
-Recorder-friendly audit sensor described above.
+- a uniquely active Smart Scene; or
+- if no Smart Scene is active, a uniquely active regular Scene.
 
-## Storage
+Historical `last_recall` timestamps are seeded only as edge baselines and are never used to pick a recovery winner.
 
-The integration persists only the master automatic-recovery switch. It does not persist scene state, light state, ON/OFF intent, or audit timestamps.
+## Installation status
 
-## Requirements
+This archive is a **build artifact only**. Creating it does not modify the live Home Assistant installation.
+
+For the repository/HACS workflow, replace the repository source with this build, publish it, refresh HACS repository information, update Hue Scene Recall, and restart/reload Home Assistant as appropriate. Keep v0.2.1 available as rollback until v0.3.0 is verified on the live instance.
+
+## Minimum environment
 
 - Home Assistant 2026.8.0 or newer
-- Built-in Philips Hue integration using Hue V2
-- aiohue supplied by that Home Assistant release
+- built-in Philips Hue integration using Hue V2
+- the aiohue version supplied by that Home Assistant release
 
-Home Assistant 2026.8 includes aiohue 4.9.0. That release exposes Hue V2 `zigbee_connectivity` resources through an event-driven controller, and the connectivity model includes `connected`, `disconnected`, `connectivity_issue`, `unidirectional_incoming`, and `pending_discovery` statuses.
-
-## Installation
-
-This ZIP is a **PROPOSED build artifact**. It has not been installed on the live Home Assistant instance.
-
-For HACS/repository deployment, replace the repository contents with this build, publish/tag `v0.2.1`, refresh HACS repository information, update Hue Scene Recall, then restart Home Assistant.
-
-## Validation included
-
-The package includes regression checks for:
-
-- active Smart Scene priority and parent recall;
-- newest regular Hue `last_recall` selection;
-- Hue `auto_dynamic` preservation;
-- no local scene/power recovery memory;
-- direct Hue `zigbee_connectivity` event subscription;
-- `connectivity_issue` as an independent recovery-arming condition;
-- HA `unavailable` as an independent recovery-arming condition;
-- waiting until **all** active recovery conditions clear before recall;
-- one fresh full-resource Hue GET per recovery;
-- Recorder-friendly diagnostic entities/timestamps;
-- soft ON/OFF changes remaining excluded from recovery logic.
+The implementation intentionally reuses Home Assistant's existing Hue runtime client/cache/event stream rather than creating a second Hue Bridge connection.

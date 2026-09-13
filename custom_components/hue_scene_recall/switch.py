@@ -13,12 +13,11 @@ from . import HueSceneRecallConfigEntry
 async def async_setup_entry(
     hass, entry: HueSceneRecallConfigEntry, async_add_entities: AddConfigEntryEntitiesCallback
 ) -> None:
-    """Set up the master automatic-recovery switch."""
     async_add_entities([HueRecallMasterSwitch(entry.runtime_data)])
 
 
 class HueRecallMasterSwitch(SwitchEntity):
-    """Globally enable/disable Hue connectivity/availability scene recovery."""
+    """Globally enable or disable automatic exact-light recovery."""
 
     _attr_should_poll = False
     _attr_icon = "mdi:restore"
@@ -26,6 +25,7 @@ class HueRecallMasterSwitch(SwitchEntity):
 
     def __init__(self, manager) -> None:
         self.manager = manager
+        # Preserve the v0.2.x entity identity.
         self._attr_unique_id = f"{manager.hue_entry.entry_id}:master_recall"
 
     async def async_added_to_hass(self) -> None:
@@ -49,12 +49,12 @@ class HueRecallMasterSwitch(SwitchEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         return {
             "label": "hueRecall",
-            "enrolled_rooms": sum(
-                1 for room in self.manager.rooms.values() if room.enrolled
-            ),
+            "enrolled_rooms": sum(1 for room in self.manager.rooms.values() if room.enrolled),
             "total_rooms": len(self.manager.rooms),
+            "recovery_scope": "exact_hue_light",
             "recovery_trigger": "hue_connectivity_issue_or_ha_unavailable_recovery",
             "scene_source_of_truth": "hue_bridge",
-            "diagnostics": "per_room_recorder_sensor",
+            "persistent_recovery_state": "controller_identity_only",
+            "power_writes": "never",
             "behavior_when_off": "no_automatic_recovery",
         }
